@@ -41,13 +41,10 @@ IMAGE_PATH_RE = re.compile(r"<image_local_path>([^<]+)</image_local_path>")
 # 去抓,整句话都会当成文件名删掉。宁可丢一个中文文件名,也不能吃用户的话。
 NAME_CHARS = r"[A-Za-z0-9_./\\:\-~%+=@]"
 AT_IMAGE_RE = re.compile(rf"@image#?\d*:({NAME_CHARS}+)")
-AT_MARK_RE = re.compile(rf'@(?:long-text|image)#?\d*:(?:"[^"]*"|{NAME_CHARS}*)\s*')
 
-# @long-text 要单独处理,不能跟着 image 一起无条件删。
-# 后面跟着 <long_text_quote> 时,预览串是正文前 20 字的重复,删掉不丢信息;
-# 没跟引文块时,这串预览是这个引用留下的唯一痕迹——删了就只剩一对空反引号。
-# 判据是机械的(同一体内有没有引文块),不猜语义。
-LONG_TEXT_MARK_RE = re.compile(rf'@long-text#?\d*:(?:"([^"]*)"|({NAME_CHARS}*))')
+# 两种标记共用一套语法,所以只认一遍:改一处就不会漏另一处。
+# 分组:1 = 标记种类,2 = 引号里的内容,3 = 裸路径,4 = 后面跟的空白。
+AT_MARK_RE = re.compile(rf'@(long-text|image)#?\d*:(?:"([^"]*)"|({NAME_CHARS}*))(\s*)')
 LONG_TEXT_PREVIEW_MAX = 60
 
 # @skill: / @file: 是「用户当时点了哪个技能、哪个文件」的唯一记录。
@@ -300,19 +297,37 @@ def render_markers(text: str) -> str:
     return text
 
 
-def render_long_text(text: str) -> str:
-    """把没有引文块的 @long-text 换成看得见的占位,而不是删掉。
+def render_marks(text: str) -> str:
+    """处理 @long-text / @image:该删的删,该留的换成看得见的占位。
 
-    用户在正文里讨论这个标记本身时(``比如 `@long-text:"预览"` 会被删``),
-    原来的删法会留下一对空反引号:原话消失,而且看不出少了什么。
+    - `@image:…` 是附件,图片另有一份 `[图片 x]` 记录,标记本身删掉。
+    - `@long-text` 逐个标记判断:从这个标记到下一个标记之间,如果跟着
+      `<long_text_quote>`,这串预览就是正文前二十字的重复,删掉;没跟就是
+      这次引用留下的唯一痕迹,换成 `[长引用 「…」]`——用户在正文里讨论这个
+      标记本身时,原来的删法会留下一对空反引号,原话消失还看不出来。
+
+    判据是「这个标记后面跟没跟引文块」,不是「这一段里有没有」:后者会让
+    一个真的引用把同一句里讨论用的标记一起带走。位置比语义可靠。
     """
-    def repl(m) -> str:
-        preview = (m.group(1) if m.group(1) is not None else (m.group(2) or "")).strip()
+    out, pos = [], 0
+    matches = list(AT_MARK_RE.finditer(text))
+    for i, m in enumerate(matches):
+        out.append(text[pos:m.start()])
+        pos = m.end()
+        if m.group(1) == "image":
+            continue
+
+        nxt = matches[i + 1].start() if i + 1 < len(matches) else len(text)
+        if "<long_text_quote" in text[m.end():nxt]:
+            continue  # 预览是正文的重复
+
+        preview = (m.group(2) if m.group(2) is not None else (m.group(3) or "")).strip()
         if len(preview) > LONG_TEXT_PREVIEW_MAX:
             preview = preview[:LONG_TEXT_PREVIEW_MAX] + "…"
-        return f"[长引用 「{preview}」]" if preview else "[长引用]"
-
-    return LONG_TEXT_MARK_RE.sub(repl, text)
+        out.append(f"[长引用 「{preview}」]" if preview else "[长引用]")
+        out.append(m.group(4))  # 保住标记后面原来的空白
+    out.append(text[pos:])
+    return "".join(out)
 
 
 def drop_tag_blocks(text: str, tags) -> str:
@@ -384,13 +399,9 @@ def clean_body(body: str):
     """
     paths = [p.strip() for p in IMAGE_PATH_RE.findall(body)]
     names = AT_IMAGE_RE.findall(body)
-    # 体内跟没跟引文块,决定 @long-text 的预览串是「重复」还是「唯一线索」
-    has_quote = "<long_text_quote" in body
 
     body = render_markers(body)
-    if not has_quote:
-        body = render_long_text(body)
-    body = AT_MARK_RE.sub("", body)
+    body = render_marks(body)
     body = IMAGE_PATH_RE.sub("", body)
     body = re.sub(r'<system-reminder\s+data-role="[^"]*"[\s\S]*?</system-reminder>', "", body)
     # long_text_quote 是用户 @ 引用粘进来的正文,脱壳但正文留着
@@ -1092,6 +1103,15 @@ def segment_span(turns, start, end):
     return f"{fmt_time(min(stamps))} ~ {fmt_time(max(stamps))}" if stamps else "?"
 
 
+def is_partial(meta) -> bool:
+    """这次导出的是全量还是一段。
+
+    header 里的「本段」和包名里的 `-fromN` 都靠它,只写一处——两处各写一遍
+    「start > 1 or end < total」的话,改其中一处时另一处极容易漏掉。
+    """
+    return meta["start"] > 1 or meta["end"] < meta["total"]
+
+
 def document_header(meta, calls, compact):
     """导出的文件头。meta 里的会话 ID / 工作目录 / 时间跨度是模型猜不出来的真事实。"""
     lines = [
@@ -1104,7 +1124,7 @@ def document_header(meta, calls, compact):
     ]
     if compact:
         lines.append(f"- 模式:压缩版(单条助手 {COMPACT_SAY} 字、单轮 {COMPACT_TURN} 字、用户 {COMPACT_USER} 字)")
-    if meta["start"] > 1 or meta["end"] < meta["total"]:
+    if is_partial(meta):
         lines.append(f"- 本段:第 {meta['start']} ~ {meta['end']} 个用户发言"
                      f"(共 {meta['total']} 个,其余未包含)")
     return lines
@@ -1112,7 +1132,7 @@ def document_header(meta, calls, compact):
 
 def package_path_for(out_path: Path, meta) -> Path:
     """包和正文落在同一个目录,靠名字区分。分段导出才带 -fromN。"""
-    suffix = "" if meta["start"] == 1 and meta["end"] == meta["total"] else f"-from{meta['start']}"
+    suffix = f"-from{meta['start']}" if is_partial(meta) else ""
     return out_path.parent / f"{meta['session_id']}{suffix}-package.md"
 
 

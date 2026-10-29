@@ -61,6 +61,17 @@ class 长引用标记(unittest.TestCase):
         self.assertIn("预览", out)
         self.assertIn("会被删掉", out)
 
+    def test_同一体内既有引文块又有讨论时逐个标记判断(self):
+        # 判据不能是「这个体内有没有引文块」——那样一个真的引用会把同一句里
+        # 讨论用的标记一起带走。得看每个标记自己后面跟没跟引文块。
+        out = fork.clean_user(
+            '<user_query>看 @long-text:"预览" <long_text_quote>完整正文</long_text_quote> '
+            '但 `@long-text:"例子"` 这种也会被删</user_query>')
+        self.assertIn("完整正文", out)
+        self.assertNotIn("预览", out)              # 跟着引文块,预览是重复
+        self.assertIn("[长引用 「例子」]", out)     # 没跟引文块,是唯一线索
+        self.assertNotIn("``", out)
+
 
 class 碎片判据(unittest.TestCase):
     """整段只剩协议碎片才清掉。判据是「整段被一个已知标签包住」。"""

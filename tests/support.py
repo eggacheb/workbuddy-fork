@@ -18,8 +18,10 @@ FORK_PY = SCRIPTS / "fork.py"
 
 # 函数级用例要 import fork。import 时它会读 WORKBUDDY_HOME 定下 PROJECTS_DIR,
 # 所以先把家目录指到一个空临时目录,免得误扫真实会话。
+# 不能用 setdefault:环境里本来就有这个变量时它会静默沿用,PROJECTS_DIR 就指到
+# 真实家目录去了——那样用例的结果取决于这台机器上聊过什么。
 _IMPORT_HOME = tempfile.mkdtemp(prefix="wbfork-import-")
-os.environ.setdefault("WORKBUDDY_HOME", _IMPORT_HOME)
+os.environ["WORKBUDDY_HOME"] = _IMPORT_HOME
 sys.path.insert(0, str(SCRIPTS))
 
 import fork  # noqa: E402  (必须放在指好家目录之后)
