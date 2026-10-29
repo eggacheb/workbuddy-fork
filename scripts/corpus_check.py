@@ -9,7 +9,8 @@
     python scripts/corpus_check.py --compare base.json   和基线比
     python scripts/corpus_check.py --equiv HEAD~1        和某个提交的版本比输出
 
-退出码:0 正常;1 有指标变少 / 输出有差异;2 用法或环境出错。
+退出码:0 正常;1 有指标变差(内容被吃掉 / 体外残留变多 / 有幽灵发言)/ 输出有差异;
+2 用法或环境出错。
 
 为什么临时文件走 tempfile.gettempdir():Git Bash 的 /tmp 在 Windows 版
 Python 眼里不是那个路径,照着写会静默比对两份不存在的文件——这个坑踩过一次,
@@ -41,6 +42,12 @@ FORK_PY = REPO / "scripts" / "fork.py"
 # 会话数会随聊天增长,原始消息数也是;所以只把「变少」当回归信号。
 GROWING = {"会话数", "原始 user 消息"}
 
+# 这一项反过来:**变多**才是坏消息。它数的是「有 query 的发言里,体外剥完还剩字」
+# 的条数——剩下的每个字都是平台塞进来而我们的规则没认出来的东西,或者是「真话被
+# 挪到 query 外面」的早期警报。纯 [图片] 占位不算(那是脚本自己渲染的)。
+# 注意「计入发言」发现不了后一种:真话挪到体外时体内照样有字,计数不会掉。
+BAD_WHEN_UP = {"体外残留"}
+
 
 def collect(projects_dir: Path) -> dict:
     """扫一遍,返回各项计数。"""
@@ -51,6 +58,7 @@ def collect(projects_dir: Path) -> dict:
         "整条丢掉": 0,
         "长引用占位": 0,
         "幽灵发言": 0,
+        "体外残留": 0,
     }
     for p in sorted(projects_dir.glob("*/*.jsonl")):
         if not p.is_file():
@@ -60,7 +68,10 @@ def collect(projects_dir: Path) -> dict:
             if r.get("type") != "message" or r.get("role") != "user":
                 continue
             stats["原始 user 消息"] += 1
-            said = fork.clean_user(fork.msg_text(r))
+            raw = fork.msg_text(r)
+            if fork.outer_residue(raw):
+                stats["体外残留"] += 1
+            said = fork.clean_user(raw)
             if not said:
                 stats["整条丢掉"] += 1
                 continue
@@ -88,28 +99,43 @@ def print_stats(stats: dict):
 
 
 def compare(now: dict, base: dict) -> int:
-    """任何一项变少都算回归——变少说明新规则吃掉了真实内容。"""
-    rows, bad = [], []
+    """任何一项变差都算回归。
+
+    方向有两类,不写反:**吃掉真实内容**的指标(计入发言、长引用占位)变少是坏;
+    **体外残留**变多是坏。两者都不看「变好」的方向——那说明规则认出了新的东西,
+    只该改基线,不该报警。
+    """
+    rows, worse = [], []
     for key, old in base.items():
         new = now.get(key)
         if new is None or key in GROWING:
             continue
         delta = new - old
         rows.append((key, old, new, delta))
-        if delta < 0:
-            bad.append((key, old, new, delta))
+        bad_direction = delta > 0 if key in BAD_WHEN_UP else delta < 0
+        if bad_direction:
+            worse.append((key, old, new, delta))
 
     for key, old, new, delta in rows:
-        mark = "  ← 变少了" if delta < 0 else ""
+        if key in BAD_WHEN_UP:
+            mark = "  ← 变多了" if delta > 0 else ""
+        else:
+            mark = "  ← 变少了" if delta < 0 else ""
         print(f"  {pad(key, 16)} {old:>7} → {new:>7}  ({delta:+d}){mark}")
 
     if now.get("幽灵发言"):
         print(f"\n幽灵发言 {now['幽灵发言']} 条:体内只剩标签的注入被算成了用户发言。")
         return 1
-    if bad:
-        print(f"\n{len(bad)} 项指标变少,疑似剥掉了真实内容。逐条回原文核对。")
+    if worse:
+        lost = [w for w in worse if w[0] not in BAD_WHEN_UP]
+        grew = [w for w in worse if w[0] in BAD_WHEN_UP]
+        if lost:
+            print(f"\n{len(lost)} 项指标变少,疑似剥掉了真实内容。逐条回原文核对。")
+        if grew:
+            print(f"\n{len(grew)} 项指标变多(体外残留):平台往 <user_query> 外面塞了"
+                  "没认出来的东西。先确认那不是用户说的话——是的话,判据要改,不要放行。")
         return 1
-    print("\n没有指标变少。")
+    print("\n没有指标变差。")
     return 0
 
 

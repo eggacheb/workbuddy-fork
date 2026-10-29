@@ -515,6 +515,33 @@ def clean_body(body: str, refs=()):
     return body, paths, names
 
 
+def split_query(text: str):
+    """切出「体外原文」和「体内各段」。没有 query 时体内是空列表。
+
+    摘要块先删、信封先剥,两步都必须在切分之前:<cb_summary> 里嵌着上一轮的
+    <user_query>,信封里可能躺着字面标签(AGENTS.md 整篇注在 user-context 里)。
+    顺序错了会从错误的位置切开——注入被当原话、原话被当注入。
+    """
+    text = drop_tag_blocks(text, SUMMARY_BLOCKS)
+    text = ENVELOPE_RE.sub("", text)
+    parts = QUERY_RE.split(text)  # 奇数位是 query 体内
+    return "\n".join(parts[0::2]), parts[1::2]
+
+
+def outer_residue(text: str) -> str:
+    """有 <user_query> 的发言,体外剥干净之后还剩什么(附件占位不算)。
+
+    只给回归脚本用。没 query 的消息返回空串——那种消息的体外就是用户原话,
+    不是「残留」。剩下的每个字都是平台塞进来、而按标签剥的规则没认出来的东西:
+    它是「我们又漏了一种注入」的指标,也可能是「真话被挪到 query 外面了」的警报。
+    """
+    outer, bodies = split_query(text)
+    if not bodies:
+        return ""
+    remaining, _, _ = clean_outer(outer)
+    return re.sub(r"\[图片[^\]]*\]", "", remaining).strip()
+
+
 def clean_user(text: str) -> str:
     """剥掉平台注入的上下文,只留用户真的说过的话。
 
@@ -525,26 +552,28 @@ def clean_user(text: str) -> str:
     摘要块必须先删再拆体内外——<cb_summary> 里嵌着历史消息的 <user_query>,
     那是上一轮的重复,不是这一轮说的话。
     """
-    text = drop_tag_blocks(text, SUMMARY_BLOCKS)
-
     # 文件引用清单在 <user_references> 里,而那一块在体外、随后会被整块删掉。
-    # 所以必须在这里先取好,再拆体内外。
-    refs = referenced_paths(text)
+    # 所以必须在这里先取好,再拆体内外。摘要块里嵌着上一轮的消息,那里的清单
+    # 不算这一轮的——先删摘要,再取清单。
+    refs = referenced_paths(drop_tag_blocks(text, SUMMARY_BLOCKS))
 
-    # 信封里可能躺着字面标签(AGENTS.md 整篇注在 user-context 里),先剥掉再切。
-    text = ENVELOPE_RE.sub("", text)
-
-    parts = QUERY_RE.split(text)  # 奇数位是 query 体内
-    remaining, paths, names = clean_outer("\n".join(parts[0::2]))
+    outer, bodies = split_query(text)
+    # 只要这一轮有 <user_query>,平台就把原话包好了:体外剩下的全是它自己拼的
+    # 注入——包括那些不在标签里、按标签剥碰不到的一整段(`de650383` 里有 420 字
+    # 的「**必须剥的注入**:…」躺在闭合标签后面)。全库实测:2135 条带 query 的
+    # 发言里,体外残留非空的只有 49 条,47 条是 clean_outer 自己渲染出的重复
+    # [图片](附件另有 [图片 名字](路径) 记录),2 条是那段裸注入,没有一条是
+    # 用户说的话。反过来,**没有** query 的老消息体外就是原话,一个字都不能碰。
+    remaining, paths, names = clean_outer(outer)
 
     texts = []
-    for body in parts[1::2]:
+    for body in bodies:
         cleaned, body_paths, body_names = clean_body(body, refs)
         paths.extend(body_paths)
         names.extend(body_names)
         if cleaned:
             texts.append(cleaned)
-    if remaining:
+    if remaining and not bodies:
         texts.append(remaining)
 
     extras = []

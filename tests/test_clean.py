@@ -241,6 +241,51 @@ class 体内外切分(unittest.TestCase):
         self.assertNotIn("体内是用户原话", out)   # 注入不能混进原话
 
 
+class 有query时体外的残留(unittest.TestCase):
+    """体外不只有标签:有时一大段注入直接躺在 `<user_query>` 外面,不在任何标签里。
+
+    按标签剥的规则碰不到它,于是它被当成「残留」拼在导出末尾。真实形态见
+    `de650383` 第 1 条发言:420 字的 `**必须剥的注入**:…` 跟在闭合标签后面。
+    判据落在「这一轮有没有 query」上,不看残留长什么样。
+    """
+
+    def test_有query时体外那段裸注入不进导出(self):
+        text = (
+            '<user_query>帮我看下这个正则</user_query>\n\n'
+            '**必须剥的注入**：`<system-reminder>`、`<task-notification>`；'
+            '真实用户输入优先取 `<user_query>…</user_query>` 里的内容。'
+        )
+        self.assertEqual(fork.clean_user(text), "帮我看下这个正则")
+
+    def test_没有query的老消息体外原话照旧留着(self):
+        # 判据是「这条消息有没有 <user_query>」,不是「体外一律不要」。
+        # 老日志里有一批消息根本没包 query,体外那一段就是用户的原话:
+        # 全库 1050 条没 query 的消息里,靠这条路径留下的正文有 27 条。
+        out = fork.clean_user("这句没有标签包裹，但它就是用户说的话")
+        self.assertEqual(out, "这句没有标签包裹，但它就是用户说的话")
+
+    def test_体外那段重复的图片占位不会和附件记录撞成两份(self):
+        # 带图消息的真实形态:标记在体内,<image_local_path> 和 input_image 在体外。
+        # 体外那串 [图片] 是 clean_outer 自己渲染的,附件早有
+        # [图片 名字](路径) 一份记录;两份都留着,读者会以为贴了两张图。
+        text = ('<user_query>@image#1:Clipboard_Screenshot.png 这里是空的</user_query>\n'
+                '[图片]\n'
+                '<image_local_path>C:/x/a.png</image_local_path>')
+        out = fork.clean_user(text)
+        self.assertEqual(out.count("[图片"), 1)
+        self.assertIn("Clipboard_Screenshot.png", out)
+        self.assertIn("这里是空的", out)
+
+    def test_残留指标只算没被认出来的字(self):
+        # corpus_check 的「体外残留」靠它报警,口径必须在函数上钉住:
+        # 附件占位是脚本自己渲染的,不算;没 query 的消息体外就是原话,也不算。
+        self.assertEqual(
+            fork.outer_residue('<user_query>x</user_query>\n[图片]\n平台又塞了一段'),
+            "平台又塞了一段")
+        self.assertEqual(fork.outer_residue('<user_query>x</user_query>\n[图片]'), "")
+        self.assertEqual(fork.outer_residue("没有 query 的原话"), "")
+
+
 class 碎片判据(unittest.TestCase):
     """整段只剩协议碎片才清掉。判据是「整段被一个已知标签包住」。"""
 
