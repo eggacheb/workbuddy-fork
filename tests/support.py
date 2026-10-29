@@ -60,11 +60,18 @@ def write_session(home, records, session_id="sess0001", project="proj"):
     return path
 
 
-def simple_session(home, n=5, session_id="sess0001"):
-    """n 个用户发言的会话,每个都带一句助手回复。"""
+def simple_session(home, n=5, session_id="sess0001", cwd=None):
+    """n 个用户发言的会话,每个都带一句助手回复。
+
+    cwd 给了就写进每条用户记录——脚本从日志里读工作目录,读不到宁可留空,
+    所以想测「工作目录」那行就必须真的写进去。
+    """
     recs = [ai_title("测试会话")]
     for i in range(1, n + 1):
-        recs.append(user_turn(i, f"第{i}个问题"))
+        u = user_turn(i, f"第{i}个问题")
+        if cwd:
+            u["cwd"] = cwd
+        recs.append(u)
         recs.append(assistant_turn(i, f"第{i}个回答"))
     write_session(home, recs, session_id)
     return session_id

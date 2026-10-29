@@ -12,22 +12,31 @@ import support
 from support import run_cli, out_text, err_text
 
 
-class 区间(unittest.TestCase):
+class _TempHome(unittest.TestCase):
+    """每个用例一份临时家目录,外加一个 out/ 目录和一份 N 轮的会话。"""
+
+    N = 3
+
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
         self.home = Path(self._tmp.name)
+        self.out = self.home / "out"
+        self.out.mkdir()
+        self.sid = support.simple_session(self.home, n=self.N)
 
     def tearDown(self):
         self._tmp.cleanup()
 
-    def _five(self):
-        return support.simple_session(self.home, n=5)
+
+class 区间(_TempHome):
+    N = 5
 
     def test_from和last一起给是取头部不是取尾部(self):
         # 判据必须是「有没有给过 --from」而不是「start 是不是 1」,
         # 否则 --from 1 --last 2 会被当成「最后 2 句」,分叉点悄悄跑到尾巴上。
-        sid = self._five()
+        sid = self.sid
         r = run_cli("--from", "1", "--last", "2", "--stdout", "-s", sid, home=self.home)
+
         self.assertEqual(r.returncode, 0, err_text(r))
         out = out_text(r)
         self.assertIn("[1] 用户", out)
@@ -36,7 +45,7 @@ class 区间(unittest.TestCase):
         self.assertIn("第 1 ~ 2 个用户发言", out)
 
     def test_只给last是取最后N句(self):
-        sid = self._five()
+        sid = self.sid
         r = run_cli("--last", "2", "--stdout", "-s", sid, home=self.home)
         self.assertEqual(r.returncode, 0, err_text(r))
         out = out_text(r)
@@ -45,7 +54,7 @@ class 区间(unittest.TestCase):
         self.assertNotIn("[3] 用户", out)
 
     def test_from单独用取到结尾(self):
-        sid = self._five()
+        sid = self.sid
         r = run_cli("--from", "4", "--stdout", "-s", sid, home=self.home)
         out = out_text(r)
         self.assertIn("[4] 用户", out)
@@ -53,23 +62,13 @@ class 区间(unittest.TestCase):
         self.assertNotIn("[3] 用户", out)
 
     def test_from超出总数时明确报错(self):
-        sid = self._five()
+        sid = self.sid
         r = run_cli("--from", "99", "--stdout", "-s", sid, home=self.home)
         self.assertEqual(r.returncode, 2)
         self.assertIn("没有内容", err_text(r))
 
 
-class 上下文包不被正文覆盖(unittest.TestCase):
-    def setUp(self):
-        self._tmp = tempfile.TemporaryDirectory()
-        self.home = Path(self._tmp.name)
-        self.out = self.home / "out"
-        self.out.mkdir()
-        self.sid = support.simple_session(self.home, n=3)
-
-    def tearDown(self):
-        self._tmp.cleanup()
-
+class 上下文包不被正文覆盖(_TempHome):
     def test_out正好指向包时拒绝并保留原内容(self):
         # 包是用户手填的唯一副本。覆盖掉不会有任何提示,而「已导出」照常打印。
         pkg = self.out / f"{self.sid}-package.md"
@@ -283,6 +282,114 @@ class 自检(unittest.TestCase):
         self.assertIn("%", out)
         # 只看哪节在膨胀,不给达标线
         self.assertNotIn("合格", out)
+
+
+class 正常导出(_TempHome):
+    def test_打印路径规模跨度并真的落盘(self):
+        out_file = self.out / "a.md"
+        r = run_cli("--out", str(out_file), "-s", self.sid, home=self.home)
+        self.assertEqual(r.returncode, 0, err_text(r))
+        text = out_text(r)
+        self.assertIn("已导出", text)
+        self.assertIn("规模:", text)
+        self.assertIn("跨度:第 1 ~ 3 个用户发言", text)
+        self.assertTrue(out_file.is_file())
+
+        doc = out_file.read_text(encoding="utf-8")
+        self.assertIn("# 会话记录:测试会话", doc)
+        self.assertIn(f"- 会话 ID:`{self.sid}`", doc)
+        self.assertIn("用户发言 3 次", doc)
+        self.assertIn("---", doc)
+
+    def test_分段导出在header里标明本段(self):
+        r = run_cli("--from", "2", "--last", "1", "--out", str(self.out / "a.md"),
+                    "-s", self.sid, home=self.home)
+        self.assertEqual(r.returncode, 0, err_text(r))
+        doc = (self.out / "a.md").read_text(encoding="utf-8")
+        self.assertIn("本段:第 2 ~ 2 个用户发言", doc)
+
+    def test_压缩版在header里标明模式(self):
+        r = run_cli("--compact", "--out", str(self.out / "a.md"), "-s", self.sid, home=self.home)
+        self.assertEqual(r.returncode, 0, err_text(r))
+        doc = (self.out / "a.md").read_text(encoding="utf-8")
+        self.assertIn("模式:压缩版", doc)
+
+
+class 出包(_TempHome):
+    def setUp(self):
+        super().setUp()
+        self.sid = support.simple_session(self.home, n=3, session_id="cwd00001",
+                                          cwd=r"D:\code\demo")
+
+    def test_骨架含五个节和来源信息(self):
+        r = run_cli("--package", "--out", str(self.out / "原文.md"), "-s", self.sid, home=self.home)
+        self.assertEqual(r.returncode, 0, err_text(r))
+        out = out_text(r)
+        self.assertIn("上下文包骨架", out)
+        for 节 in ("## 之前那条线到哪了", "## 已经定下的", "## 试过但不通的",
+                  "## 关键事实", "## 这次要做"):
+            self.assertIn(节, out)
+        # 机械部分由脚本填,人话部分留注释给模型
+        self.assertIn(f"来源会话 `{self.sid}`", out)
+        self.assertIn(r"工作目录 `D:\code\demo`", out)
+        self.assertIn("<!--", out)
+
+    def test_全量导出的包名不带from(self):
+        r = run_cli("--package", "--out", str(self.out / "原文.md"), "-s", self.sid, home=self.home)
+        self.assertEqual(r.returncode, 0, err_text(r))
+        self.assertTrue((self.out / f"{self.sid}-package.md").is_file())
+
+    def test_分段导出的包名带from(self):
+        r = run_cli("--from", "2", "--package", "--out", str(self.out / "原文.md"),
+                    "-s", self.sid, home=self.home)
+        self.assertEqual(r.returncode, 0, err_text(r))
+        self.assertTrue((self.out / f"{self.sid}-from2-package.md").is_file())
+        self.assertFalse((self.out / f"{self.sid}-package.md").exists())
+
+
+class 写入失败(_TempHome):
+    def test_out指向目录(self):
+        r = run_cli("--out", str(self.out), "-s", self.sid, home=self.home)
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("这是目录", err_text(r))
+
+    def test_check指向目录(self):
+        r = run_cli("--check", str(self.out), home=self.home)
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("要文件路径", err_text(r))
+
+    def test_check找不到文件(self):
+        r = run_cli("--check", str(self.home / "根本没有.md"), home=self.home)
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("找不到文件", err_text(r))
+
+
+class 超长提醒(unittest.TestCase):
+    """整段读会吃掉大量上下文,所以超过 150k 要给降级建议,而不是闷声导出。"""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.home = Path(self._tmp.name)
+        self.sid = "bigsess1"
+        recs = [support.ai_title("长会话"),
+                support.user_turn(1, "长会话"),
+                support.assistant_turn(1, "填充" * 80_000)]
+        support.write_session(self.home, recs, self.sid)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_落盘时提示改用compact或分段(self):
+        r = run_cli("--out", str(self.home / "big.md"), "-s", self.sid, home=self.home)
+        self.assertEqual(r.returncode, 0, err_text(r))
+        text = out_text(r)
+        self.assertIn("150k", text)
+        self.assertIn("--compact", text)
+
+    def test_stdout时把警告写到stderr(self):
+        r = run_cli("--stdout", "-s", self.sid, home=self.home)
+        self.assertEqual(r.returncode, 0, err_text(r))
+        self.assertIn("注意:这段", err_text(r))
 
 
 if __name__ == "__main__":

@@ -15,6 +15,7 @@ import sys
 import tempfile
 import time
 from collections import Counter
+from dataclasses import dataclass
 from pathlib import Path
 
 # 无条件 utf-8 + replace。
@@ -984,6 +985,40 @@ def resolve_session(args):
     return hits[0], note
 
 
+@dataclass
+class Session:
+    """被导出的那一份会话:原文记录 + 已经切成轮次的主线。"""
+
+    id: str
+    records: list
+    turns: list
+    title: str
+
+
+def open_session(args):
+    """定位会话并抽出主线,返回 (Session, 退出码);失败时 Session 是 None。
+
+    定位失败就是错误,不猜:「导出成功」和「导出了你要的那条」是两件事,
+    而后者错了没人看得出来。
+    """
+    path, note = resolve_session(args)
+    if not path:
+        if note:
+            print(note, file=sys.stderr)
+        return None, 2
+    if note:
+        print(f"({note})", file=sys.stderr)
+
+    records = load_records(path)
+    turns = build_turns(records)
+    if not turns:
+        print("这个会话里没有可提取的对话。", file=sys.stderr)
+        print("如果日志不是 WorkBuddy 格式(比如装进了 Claude Code),提取会全部落空。", file=sys.stderr)
+        return None, 2
+
+    return Session(path.stem, records, turns, read_title(records)), 0
+
+
 def cmd_outline(turns, title, session_id) -> int:
     print(f"会话「{title or session_id}」共 {len(turns)} 个用户发言:\n")
     for i, turn in enumerate(turns, 1):
@@ -995,7 +1030,13 @@ def cmd_outline(turns, title, session_id) -> int:
     return 0
 
 
-def main():
+# ---------- 命令行 ----------
+
+# 超过这个长度,整段读会吃掉大量上下文,该建议降级
+LONG_DOC = 150_000
+
+
+def build_parser():
     ap = argparse.ArgumentParser(
         description="导出 WorkBuddy 会话主线,用于开新分支",
         epilog="读全量的判据不是轮数,是「包的四个待填节能不能写出内容」。",
@@ -1015,12 +1056,11 @@ def main():
     ap.add_argument("--check", metavar="FILE", help="按节报篇幅占比,指出哪节在膨胀")
     ap.add_argument("--out", help="输出文件路径,默认写系统临时目录")
     ap.add_argument("--stdout", action="store_true", help="直接打印全文到标准输出")
-    args = ap.parse_args()
+    return ap
 
-    if args.check:
-        return check_package(args.check)
-    if args.list:
-        return cmd_list()
+
+def validate_args(ap, args):
+    """互斥检查。--check / --list 不看正文,所以这一步排在它们后面跑。"""
     if args.stdout and args.package:
         ap.error("--stdout 与 --package 互斥:包总是先落盘再打印")
     if args.force and not args.package:
@@ -1028,31 +1068,14 @@ def main():
     if args.stdout and args.out:
         ap.error("--stdout 与 --out 互斥:一个往屏幕写,一个往文件写")
 
-    path, note = resolve_session(args)
-    if not path:
-        if note:
-            print(note, file=sys.stderr)
-        return 2
-    if note:
-        print(f"({note})", file=sys.stderr)
 
-    real_id = path.stem
-    records = load_records(path)
-    turns = build_turns(records)
-    if not turns:
-        print("这个会话里没有可提取的对话。", file=sys.stderr)
-        print("如果日志不是 WorkBuddy 格式(比如装进了 Claude Code),提取会全部落空。", file=sys.stderr)
-        return 2
+def compute_range(args, total):
+    """把 --from / --last 换算成 1-based 闭区间 (start, end)。
 
-    title = read_title(records)
-    total = len(turns)
-
-    if args.outline:
-        return cmd_outline(turns, title, real_id)
-
-    # --from 是起点,--last 是长度,两个可以一起给。判据必须是「用户有没有
-    # 给过 --from」而不是「start 是不是 1」——否则 --from 1 --last 40 会被
-    # 当成「最后 40 句」,分叉点悄悄跑到尾巴上去。
+    --from 是起点,--last 是长度,两个可以一起给。判据必须是「用户有没有
+    给过 --from」而不是「start 是不是 1」——否则 --from 1 --last 40 会被
+    当成「最后 40 句」,分叉点悄悄跑到尾巴上去。
+    """
     start = args.start if args.start is not None else 1
     end = total
     if args.last:
@@ -1060,45 +1083,73 @@ def main():
             end = min(total, start + args.last - 1)
         else:
             start = max(1, total - args.last + 1)
+    return start, end
 
-    body = render_turns(turns, start, end, compact=args.compact)
-    if not body.strip():
-        print(f"从第 {start} 个发言开始没有内容(总共只有 {total} 个)。", file=sys.stderr)
-        return 2
 
-    seg = turns[start - 1:end]
-    seg_ts = [t["ts"] for t in seg if t.get("ts")]
-    span = f"{fmt_time(min(seg_ts))} ~ {fmt_time(max(seg_ts))}" if seg_ts else "?"
-    calls = sum(1 for r in records if r.get("type") == "function_call")
+def segment_span(turns, start, end):
+    """这段发言的时间跨度。没有时间戳就写 ?,不编。"""
+    stamps = [t["ts"] for t in turns[start - 1:end] if t.get("ts")]
+    return f"{fmt_time(min(stamps))} ~ {fmt_time(max(stamps))}" if stamps else "?"
 
-    header = [
-        f"# 会话记录:{title or '(无标题)'}",
+
+def document_header(meta, calls, compact):
+    """导出的文件头。meta 里的会话 ID / 工作目录 / 时间跨度是模型猜不出来的真事实。"""
+    lines = [
+        f"# 会话记录:{meta['title'] or '(无标题)'}",
         "",
-        f"- 会话 ID:`{real_id}`",
-        f"- 工作目录:`{read_cwd(records) or '未知'}`",
-        f"- 时间:{span}",
-        f"- 全量:用户发言 {total} 次,工具调用 {calls} 次",
+        f"- 会话 ID:`{meta['session_id']}`",
+        f"- 工作目录:`{meta['project_dir'] or '未知'}`",
+        f"- 时间:{meta['span']}",
+        f"- 全量:用户发言 {meta['total']} 次,工具调用 {calls} 次",
     ]
-    if args.compact:
-        header.append(f"- 模式:压缩版(单条助手 {COMPACT_SAY} 字、单轮 {COMPACT_TURN} 字、用户 {COMPACT_USER} 字)")
-    if start > 1 or end < total:
-        header.append(f"- 本段:第 {start} ~ {end} 个用户发言(共 {total} 个,其余未包含)")
-    doc = "\n".join(header) + "\n\n---\n\n" + body
+    if compact:
+        lines.append(f"- 模式:压缩版(单条助手 {COMPACT_SAY} 字、单轮 {COMPACT_TURN} 字、用户 {COMPACT_USER} 字)")
+    if meta["start"] > 1 or meta["end"] < meta["total"]:
+        lines.append(f"- 本段:第 {meta['start']} ~ {meta['end']} 个用户发言"
+                     f"(共 {meta['total']} 个,其余未包含)")
+    return lines
 
-    if args.stdout:
-        if len(doc) > 150_000:
-            print(f"注意:这段 {len(doc)} 字符,整段读会吃掉大量上下文。"
-                  "加 --compact,或用 --last 只取一段。", file=sys.stderr)
-        sys.stdout.write(doc)
+
+def package_path_for(out_path: Path, meta) -> Path:
+    """包和正文落在同一个目录,靠名字区分。分段导出才带 -fromN。"""
+    suffix = "" if meta["start"] == 1 and meta["end"] == meta["total"] else f"-from{meta['start']}"
+    return out_path.parent / f"{meta['session_id']}{suffix}-package.md"
+
+
+def warn_too_long(compact, start):
+    print("\n注意:这段太长(>150k 字符),整段读会吃掉大量上下文。")
+    if compact:
+        print(f"已经是最紧的模式了。改用 --from {start} --last 20 分两段,各出一份包。")
+    else:
+        print("加 --compact 压一版,或 --last 40 只取最近一段。")
+
+
+def emit_package(pkg_path: Path, seg, meta, force: bool) -> int:
+    """写包骨架。已有包默认不覆盖——那是用户手填的唯一副本。"""
+    if pkg_path.exists() and not force:
+        print(f"\n已有一份包,没覆盖:{pkg_path}")
+        print("下面是它现在的内容,确认是不是已经填好了;要重写加 --force。\n")
+        print(read_text_any(pkg_path)[0])
         return 0
 
-    out_path = Path(args.out) if args.out else TEMP_ROOT / f"{real_id}-from{start}.md"
+    skeleton = package_skeleton(meta, collect_facts(seg))
+    try:
+        write_atomic(pkg_path, skeleton)
+    except OSError as e:
+        print(f"包写不进去:{pkg_path}\n  {e}", file=sys.stderr)
+        return 2
+
+    print(f"\n上下文包骨架:{pkg_path}({len(skeleton)} 字符)")
+    print("\n--- 骨架预览(填完删注释,再跑 --check 看哪节膨胀)---\n")
+    print(skeleton)
+    return 0
+
+
+def write_export(out_path: Path, pkg_path: Path, doc: str, meta, calls: int, compact: bool) -> int:
+    """把正文落盘,并打印给人看的规模摘要。返回退出码。"""
     if out_path.is_dir():
         print(f"--out 需要文件路径,这是目录:{out_path}", file=sys.stderr)
         return 2
-
-    suffix = "" if start == 1 and end == total else f"-from{start}"
-    pkg_path = out_path.parent / f"{real_id}{suffix}-package.md"
 
     # 不管这次有没有 --package,都不能让正文落在包上。包是用户手填的唯一
     # 副本,覆盖掉不会有任何提示,而「导出成功」还会照常打印。
@@ -1115,39 +1166,64 @@ def main():
 
     print(f"已导出:{out_path}")
     print(f"规模:{len(doc)} 字符 / {len(doc.splitlines())} 行")
-    print(f"跨度:第 {start} ~ {end} 个用户发言(共 {total} 个,工具调用 {calls} 次)")
-    if len(doc) > 150_000:
-        print("\n注意:这段太长(>150k 字符),整段读会吃掉大量上下文。")
-        if args.compact:
-            print(f"已经是最紧的模式了。改用 --from {start} --last 20 分两段,各出一份包。")
-        else:
-            print("加 --compact 压一版,或 --last 40 只取最近一段。")
+    print(f"跨度:第 {meta['start']} ~ {meta['end']} 个用户发言"
+          f"(共 {meta['total']} 个,工具调用 {calls} 次)")
+    if len(doc) > LONG_DOC:
+        warn_too_long(compact, meta["start"])
+    return 0
+
+
+def main():
+    ap = build_parser()
+    args = ap.parse_args()
+
+    if args.check:
+        return check_package(args.check)
+    if args.list:
+        return cmd_list()
+    validate_args(ap, args)
+
+    sess, code = open_session(args)
+    if sess is None:
+        return code
+
+    total = len(sess.turns)
+    if args.outline:
+        return cmd_outline(sess.turns, sess.title, sess.id)
+
+    start, end = compute_range(args, total)
+    body = render_turns(sess.turns, start, end, compact=args.compact)
+    if not body.strip():
+        print(f"从第 {start} 个发言开始没有内容(总共只有 {total} 个)。", file=sys.stderr)
+        return 2
+
+    calls = sum(1 for r in sess.records if r.get("type") == "function_call")
+    meta = {
+        "session_id": sess.id,
+        "title": sess.title,
+        "project_dir": read_cwd(sess.records),
+        "start": start,
+        "end": end,
+        "total": total,
+        "span": segment_span(sess.turns, start, end),
+    }
+    doc = "\n".join(document_header(meta, calls, args.compact)) + "\n\n---\n\n" + body
+
+    if args.stdout:
+        if len(doc) > LONG_DOC:
+            print(f"注意:这段 {len(doc)} 字符,整段读会吃掉大量上下文。"
+                  "加 --compact,或用 --last 只取一段。", file=sys.stderr)
+        sys.stdout.write(doc)
+        return 0
+
+    out_path = Path(args.out) if args.out else TEMP_ROOT / f"{sess.id}-from{start}.md"
+    pkg_path = package_path_for(out_path, meta)
+    code = write_export(out_path, pkg_path, doc, meta, calls, args.compact)
+    if code:
+        return code
 
     if args.package:
-        if pkg_path.exists() and not args.force:
-            print(f"\n已有一份包,没覆盖:{pkg_path}")
-            print("下面是它现在的内容,确认是不是已经填好了;要重写加 --force。\n")
-            print(read_text_any(pkg_path)[0])
-            return 0
-        facts = collect_facts(seg)
-        meta = {
-            "session_id": real_id,
-            "title": title,
-            "project_dir": read_cwd(records),
-            "start": start,
-            "end": end,
-            "total": total,
-            "span": span,
-        }
-        skeleton = package_skeleton(meta, facts)
-        try:
-            write_atomic(pkg_path, skeleton)
-        except OSError as e:
-            print(f"包写不进去:{pkg_path}\n  {e}", file=sys.stderr)
-            return 2
-        print(f"\n上下文包骨架:{pkg_path}({len(skeleton)} 字符)")
-        print("\n--- 骨架预览(填完删注释,再跑 --check 看哪节膨胀)---\n")
-        print(skeleton)
+        return emit_package(pkg_path, sess.turns[start - 1:end], meta, args.force)
     return 0
 
 
