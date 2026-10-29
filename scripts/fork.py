@@ -33,14 +33,24 @@ PROJECTS_DIR = WB_HOME / "projects"
 TEMP_ROOT = Path(tempfile.gettempdir()).resolve() / "workbuddy-fork"
 
 REMINDER_RE = re.compile(r"<system-reminder[\s\S]*?</system-reminder>")
-QUERY_RE = re.compile(r"<user_query>([\s\S]*?)</user_query>")
+# 带 data-role 的 system-reminder 整块是平台拼的信封。必须在切体内外之前剥掉:
+# AGENTS.md 会被整篇注进 user-context,而它里面就写着 `<user_query>` 这条纪律,
+# 留着信封,非贪婪的 QUERY_RE 就会从那个字面标签开始匹配到真闭合标签——
+# 前半段注入变成「体内」、真原话变成「体外」。
+ENVELOPE_RE = re.compile(r'<system-reminder\s+data-role="[^"]*"[\s\S]*?</system-reminder>')
+# 标签被反引号包着时不算结构:用户讨论它们时会写成内联代码,那不是发言边界。
+# 两头都要判——只判开标签,非贪婪就会从真开标签一路吃到反引号里的假闭合。
+QUERY_RE = re.compile(r"(?<![`])<user_query>([\s\S]*?)</user_query>(?![`])")
 IMAGE_PATH_RE = re.compile(r"<image_local_path>([^<]+)</image_local_path>")
 
 # 标记名的字符集只收 ASCII。看起来苛刻,但这是唯一不会吃正文的写法:
 # 中文正文常紧贴标记("@image#1:a.png，这样改对不对"),一旦按「到空白为止」
 # 去抓,整句话都会当成文件名删掉。宁可丢一个中文文件名,也不能吃用户的话。
 NAME_CHARS = r"[A-Za-z0-9_./\\:\-~%+=@]"
-AT_IMAGE_RE = re.compile(rf"@image#?\d*:({NAME_CHARS}+)")
+# 反引号里的是用户在正文里举例讨论这个标记,不是附件。判据看位置、
+# 不看「有没有 <image_local_path>」:平台偶尔漏记路径,但图确实贴了,
+# 按路径判会把真附件当成讨论原样丢给新对话。
+AT_IMAGE_RE = re.compile(rf"(?<![`])@image#?\d*:({NAME_CHARS}+)")
 
 # 两种标记共用一套语法,所以只认一遍:改一处就不会漏另一处。
 # 分组:1 = 标记种类,2 = 引号里的内容,3 = 裸路径,4 = 后面跟的空白。
@@ -340,6 +350,11 @@ def render_marks(text: str) -> str:
         out.append(text[pos:m.start()])
         pos = m.end()
         if m.group(1) == "image":
+            # 反引号里的是用户在正文里举例讨论它,原样留着;否则是真附件,
+            # 标记删掉,由 [图片 …] 占位补回来。删掉讨论用的那个,会留下
+            # 空反引号,还会在消息开头凭空多出一个 [图片 …]。
+            if m.start() > 0 and text[m.start() - 1] == "`":
+                out.append(m.group(0))
             continue
 
         nxt = matches[i + 1].start() if i + 1 < len(matches) else len(text)
@@ -501,6 +516,9 @@ def clean_user(text: str) -> str:
     # 文件引用清单在 <user_references> 里,而那一块在体外、随后会被整块删掉。
     # 所以必须在这里先取好,再拆体内外。
     refs = referenced_paths(text)
+
+    # 信封里可能躺着字面标签(AGENTS.md 整篇注在 user-context 里),先剥掉再切。
+    text = ENVELOPE_RE.sub("", text)
 
     parts = QUERY_RE.split(text)  # 奇数位是 query 体内
     remaining, paths, names = clean_outer("\n".join(parts[0::2]))

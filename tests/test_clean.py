@@ -178,6 +178,53 @@ class 临时文件判据(unittest.TestCase):
         self.assertEqual(facts["edited"], [(target, 2)])
 
 
+class 体内外切分(unittest.TestCase):
+    def test_注入区里的字面标签不吃掉原话(self):
+        # AGENTS.md 被整篇注进 user-context,里面就写着「`<user_query>` 体内是
+        # 用户原话」这条纪律。非贪婪正则从那个字面标签开始匹配到真闭合标签,
+        # 前半段注入就被当成体内、真原话被当成体外——照常输出,看不出来。
+        text = (
+            '<system-reminder data-role="user-context">\n'
+            '## 改动纪律\n'
+            '- **`<user_query>` 体内是用户原话。** 只摘附件、不碰排版。\n'
+            '</system-reminder>\n'
+            '<user_query>帮我看下这个正则</user_query>'
+        )
+        self.assertEqual(fork.clean_user(text), "帮我看下这个正则")
+
+    def test_正文里反引号包住的标签不算发言起点(self):
+        # 用户在体内讨论这个标签本身,把它写进行内代码。非贪婪正则从反引号
+        # 里那个开始匹配,把「…」当成一条发言——凭空多一条,后面所有编号错位,
+        # --from N 从此指到别的地方。
+        text = (
+            '<user_query>真实用户输入优先取 `<user_query>…</user_query>` 里的内容。'
+            '帮我看下这个正则</user_query>'
+        )
+        self.assertEqual(
+            fork.clean_user(text),
+            "真实用户输入优先取 `<user_query>…</user_query>` 里的内容。帮我看下这个正则",
+        )
+
+    def test_正文里讨论的图片标记不当成真附件(self):
+        # 用户在正文里举例:`@image#1:a.png，这样改对不对`。体内没有
+        # <image_local_path>,所以那不是附件。原来的处理把它当真图:原话被删成
+        # 空反引号,消息开头还凭空多出一个 [图片 a.png]。
+        text = ('<user_query>中文常紧贴标记（`@image#1:a.png，这样改对不对`），'
+                '按空白抓会吃掉原话</user_query>')
+        out = fork.clean_user(text)
+        self.assertIn("@image#1:a.png", out)
+        self.assertNotIn("[图片", out)
+
+    def test_没有路径的图片标记仍然按附件渲染(self):
+        # 平台偶尔漏记 <image_local_path>,但用户确实贴了图。不能因为查不到
+        # 路径就当成正文里的讨论,把 @image#1:xxx.png 原样丢给新对话。
+        text = '<user_query>@image#1:Clipboard_Screenshot.png 是这个的问题吗</user_query>'
+        out = fork.clean_user(text)
+        self.assertIn("[图片 Clipboard_Screenshot.png]", out)
+        self.assertIn("是这个的问题吗", out)
+        self.assertNotIn("@image", out)
+
+
 class 碎片判据(unittest.TestCase):
     """整段只剩协议碎片才清掉。判据是「整段被一个已知标签包住」。"""
 
