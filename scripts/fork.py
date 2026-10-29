@@ -271,8 +271,12 @@ def msg_text(record) -> str:
     return "\n".join(part_text(p) for p in content if part_text(p))
 
 
-def marker_name(raw: str) -> str:
-    """把标记里的路径缩成一个能看懂的名字。"""
+def marker_name(raw: str, depth: int = 1) -> str:
+    """把标记里的路径缩成一个能看懂的名字。
+
+    depth=1 只留文件名——技能名本身就是标识,多带目录没用。
+    depth=2 留最后两段——文件只留 `y.py` 的话,新对话不知道是哪个 `y.py`。
+    """
     raw = raw.strip()
     parts = [p for p in re.split(r"[\\/]", raw) if p]
     if not parts:
@@ -280,7 +284,7 @@ def marker_name(raw: str) -> str:
     # @skill:"…/writing-for-agents/SKILL.md" 里,技能名是目录名,不是 SKILL.md
     if parts[-1].lower() in ("skill.md", "skill.markdown") and len(parts) >= 2:
         return parts[-2]
-    return parts[-1]
+    return "/".join(parts[-depth:])
 
 
 def render_markers(text: str) -> str:
@@ -293,7 +297,7 @@ def render_markers(text: str) -> str:
     text = SKILL_MARK_RE.sub(
         lambda m: f"[技能 {marker_name(m.group(1) or m.group(2))}]", text)
     text = FILE_MARK_RE.sub(
-        lambda m: f"[文件 {marker_name(m.group(1) or m.group(2))}]", text)
+        lambda m: f"[文件 {marker_name(m.group(1) or m.group(2), depth=2)}]", text)
     return text
 
 

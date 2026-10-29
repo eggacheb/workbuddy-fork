@@ -34,10 +34,20 @@ class 剥技能与文件标记(unittest.TestCase):
         self.assertEqual(fork.marker_name(r"C:\a\writing-for-agents\SKILL.md"),
                          "writing-for-agents")
 
-    def test_文件标记取文件名(self):
-        out = fork.clean_user('<user_query>@file:"/x/y.py" 看这个</user_query>')
-        self.assertIn("[文件 y.py]", out)
+    def test_文件标记留最后两段目录(self):
+        # 只留 y.py 的话,新对话不知道是哪个 y.py。图片那边留的是完整路径,
+        # 这里留两段是同一个方向:够认出是哪个文件,又不像全路径那样占篇幅。
+        out = fork.clean_user('<user_query>@file:"C:/code/proj/src/y.py" 看这个</user_query>')
+        self.assertIn("[文件 src/y.py]", out)
         self.assertIn("看这个", out)
+
+    def test_文件标记没有目录时原样(self):
+        out = fork.clean_user('<user_query>@file:"y.py" 看这个</user_query>')
+        self.assertIn("[文件 y.py]", out)
+
+    def test_文件标记的反斜杠路径也认(self):
+        out = fork.clean_user(r'<user_query>@file:"D:\code\proj\src\y.py" 看这个</user_query>')
+        self.assertIn("[文件 src/y.py]", out)
 
 
 class 长引用标记(unittest.TestCase):
