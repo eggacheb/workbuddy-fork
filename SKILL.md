@@ -32,7 +32,8 @@ python "$HOME/.workbuddy/skills/fork/scripts/fork.py" --outline
 ```
 
 - **默认从全部历史分叉**(分叉点 = 现在)。这是最常见的意思:背景全带走,新线换个方向。
-- 用户说「从第 N 句重来」时用 `--from N`——**含第 N 句本身**。要从走偏那句的下一句开始,写 `--from N+1`。
+- 用户说「从第 N 句重来」时用 `--from N`——**含第 N 句本身**。走偏的是第 7 句、想从第 8 句开始,就写 `--from 8`。
+- `--from` 和 `--last` 可以组合:`--from 20 --last 40` 是「从第 20 句往后取 40 句」。只给 `--last` 才是取最后 N 句。
 - 用户没说清、但语气像要重来时,把 outline 列给他挑,别猜。
 
 ### 2. 一条命令导出 + 出骨架
@@ -41,7 +42,7 @@ python "$HOME/.workbuddy/skills/fork/scripts/fork.py" --outline
 python "$HOME/.workbuddy/skills/fork/scripts/fork.py" --compact --package
 ```
 
-- `--compact`:单条助手发言截 200 字、单轮助手合计截 500 字、用户发言截 400 字,工具调用只留次数。122 轮 / 29 MB 的会话压完约 74k 字符。
+- `--compact`:单条助手发言截 200 字、单轮助手合计截 500 字、用户发言截 400 字,工具调用只留次数。29 MB 的会话压完约 74k 字符。
 - `--package`:同时生成 `<会话ID>-package.md` 骨架,并把骨架打到标准输出——省一次 Read。已有的包不会被覆盖,要重写得加 `--force`。
 - 会话不是当前这个时加 `--session <id>`,`--list` 可以查。
 
@@ -60,7 +61,7 @@ python "$HOME/.workbuddy/skills/fork/scripts/fork.py" --compact --package
 
 拿不准就 `--outline` 扫一眼标题:后一条在引用前一条的成果,就是递进。
 
-导出路径在系统临时目录 `workbuddy-fork/` 下,脚本会打印。**用 Read 读那个文件**——不要用 `--stdout`,长会话会被截断。
+导出路径在系统临时目录 `workbuddy-fork/` 下,脚本会打印。**用 Read 读那个文件**——别用 `--stdout` 去吞全文,工具回显有上限,长会话看着像被截断、实际只能读到一截。
 
 读的时候有完成标准,别一路读到底:**包的四个待填节都能写出内容,而且「已经定下的」每一条都能指回原文**,就够了。读不完就分段读,每读完一段先往包草稿里落一条,不要全读完再回头写。
 
