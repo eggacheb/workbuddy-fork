@@ -47,6 +47,14 @@ AT_IMAGE_RE = re.compile(rf"@image#?\d*:({NAME_CHARS}+)")
 AT_MARK_RE = re.compile(rf'@(long-text|image)#?\d*:(?:"([^"]*)"|({NAME_CHARS}*))(\s*)')
 LONG_TEXT_PREVIEW_MAX = 60
 
+# 平台真实发出的文件引用是 `@"…"`,不是 `@file:"…"`。完整路径只在
+# <user_references> 里出现一次,而那一块是平台注入,会被整块删掉;体内留的
+# `@"…"` 和 C# 的 verbatim string 长得一模一样,所以只能靠「这块清单里
+# 有没有它」来认——那是平台盖的章,也是唯一可靠的判据。
+REF_BLOCK_RE = re.compile(r"<user_references>([\s\S]*?)</user_references>")
+QUOTED_PATH_RE = re.compile(r'"([^"]+)"')
+REF_TOKEN_RE = re.compile(r'@"([^"]*)"')
+
 # @skill: / @file: 是「用户当时点了哪个技能、哪个文件」的唯一记录。
 # 删掉它等于抹掉「这句话是 /code-review 触发的」——而这件事在新对话里
 # 没有任何文件能查回来,只能靠上下文包自己说。
@@ -334,6 +342,41 @@ def render_marks(text: str) -> str:
     return "".join(out)
 
 
+def norm_ref(path: str) -> str:
+    """比对用的规范形式:日志里的路径是双反斜杠,统一成单斜杠再比。"""
+    return path.replace("\\\\", "\\").replace("\\", "/").strip("/")
+
+
+def referenced_paths(text: str):
+    """平台盖章的文件引用清单。
+
+    `<user_references>` 里明确列了「这几条是用户引用的文件」。这是区分
+    `@"a.py"` 和 C# 里 `@"verbatim string"` 的唯一信号,所以只认它。
+    """
+    return [p for block in REF_BLOCK_RE.findall(text)
+            for p in QUOTED_PATH_RE.findall(block)]
+
+
+def render_file_refs(text: str, refs) -> str:
+    """把体内 `@"…"` 换成 `[文件 …]`,只认平台列过的那些路径。
+
+    对不上的一律原样留着——宁可留一句看着像噪音的 `@"…"`,
+    也不能把代码里的 verbatim string 改写掉。
+    """
+    if not refs:
+        return text
+    known = [norm_ref(r) for r in refs]
+
+    def repl(m) -> str:
+        raw = m.group(1)
+        target = norm_ref(raw)
+        if target and any(target == k or k.endswith("/" + target) for k in known):
+            return f"[文件 {marker_name(raw, depth=2)}]"
+        return m.group(0)
+
+    return REF_TOKEN_RE.sub(repl, text)
+
+
 def drop_tag_blocks(text: str, tags) -> str:
     """整块删掉一批已知标签连同内容。"""
     for tag in tags:
@@ -388,11 +431,14 @@ def clean_outer(outer: str):
     return outer, paths, names
 
 
-def clean_body(body: str):
+def clean_body(body: str, refs=()):
     """清理 <user_query> 体内,返回 (正文, 图片路径, 图片名)。
 
     体内是用户原话——包括他 @long-text 粘进来的代码、他贴出来讨论的标签本身
     ——所以只摘附件、不碰排版。缩进和空行原样留着,代码块和栈才不会压平。
+
+    refs 是平台在 <user_references> 里列过的文件路径(在体外,拆开之前就取好了)。
+    体内那句 `@"…"` 只有对上这里面的某一条才当成文件引用,否则原样留着。
 
     允许"删"的只有 image_local_path 和带 data-role 的 system-reminder,
     它们是平台拼进来的。@skill / @file / @long-text 不删,换成看得见的占位。
@@ -406,6 +452,7 @@ def clean_body(body: str):
 
     body = render_markers(body)
     body = render_marks(body)
+    body = render_file_refs(body, refs)
     body = IMAGE_PATH_RE.sub("", body)
     body = re.sub(r'<system-reminder\s+data-role="[^"]*"[\s\S]*?</system-reminder>', "", body)
     # long_text_quote 是用户 @ 引用粘进来的正文,脱壳但正文留着
@@ -433,12 +480,16 @@ def clean_user(text: str) -> str:
     """
     text = drop_tag_blocks(text, SUMMARY_BLOCKS)
 
+    # 文件引用清单在 <user_references> 里,而那一块在体外、随后会被整块删掉。
+    # 所以必须在这里先取好,再拆体内外。
+    refs = referenced_paths(text)
+
     parts = QUERY_RE.split(text)  # 奇数位是 query 体内
     remaining, paths, names = clean_outer("\n".join(parts[0::2]))
 
     texts = []
     for body in parts[1::2]:
-        cleaned, body_paths, body_names = clean_body(body)
+        cleaned, body_paths, body_names = clean_body(body, refs)
         paths.extend(body_paths)
         names.extend(body_names)
         if cleaned:

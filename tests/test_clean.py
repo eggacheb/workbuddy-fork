@@ -83,6 +83,47 @@ class 长引用标记(unittest.TestCase):
         self.assertNotIn("``", out)
 
 
+class 引号形式的文件引用(unittest.TestCase):
+    """平台真实的文件引用是 `@"…"`,不是 `@file:"…"`。
+
+    体内那句 `@"…"` 和 C# 的 verbatim string 长得一模一样,所以只能靠
+    「这条消息的 <user_references> 里列过这个路径」来认——那是平台盖的章。
+    """
+
+    def _msg(self, body, refs):
+        lines = "".join(f'"{p}"\n' for p in refs)
+        block = ('<system-reminder data-role="additional-data">\n<user_references>\n'
+                 + lines + "</user_references>\n</system-reminder>\n")
+        return f"{block}<user_query>{body}</user_query>"
+
+    def test_平台列过的路径换成文件占位(self):
+        out = fork.clean_user(self._msg(
+            r'@"scripts\\fork.py" 我发一个文件引用，你测一下看看吧',
+            [r"D:\\code\\workbuddy-fork\\scripts\\fork.py"]))
+        self.assertIn("[文件 scripts/fork.py]", out)
+        self.assertIn("我发一个文件引用", out)
+        # 双反斜杠要收掉,否则看着像故障
+        self.assertNotIn("\\\\", out)
+
+    def test_没被平台确认的引号原样不动(self):
+        # C# 的 @"verbatim string" 也长这样,不能当文件引用
+        out = fork.clean_user(r'<user_query>var s = @"C:\\temp\\x"; 这行什么意思</user_query>')
+        self.assertIn(r'@"C:\\temp\\x"', out)
+        self.assertNotIn("[文件", out)
+
+    def test_平台列的是别的文件时不误伤(self):
+        out = fork.clean_user(self._msg(r'@"other.py" 看这个',
+                                        [r"D:\\code\\proj\\real.py"]))
+        self.assertIn('@"other.py"', out)
+        self.assertNotIn("[文件", out)
+
+    def test_引用块本身不留在正文里(self):
+        out = fork.clean_user(self._msg(r'@"a\\b.py" 看看',
+                                        [r"D:\\code\\proj\\a\\b.py"]))
+        self.assertNotIn("<user_references>", out)
+        self.assertNotIn("Note: These references", out)
+
+
 class 碎片判据(unittest.TestCase):
     """整段只剩协议碎片才清掉。判据是「整段被一个已知标签包住」。"""
 
