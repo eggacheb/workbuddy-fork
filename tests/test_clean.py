@@ -124,6 +124,33 @@ class 引号形式的文件引用(unittest.TestCase):
         self.assertNotIn("Note: These references", out)
 
 
+class 临时文件判据(unittest.TestCase):
+    """这个仓库自己就叫 workbuddy-fork,按名字判会把它的文件全滤掉。"""
+
+    def test_仓库里改过的文件不算临时文件(self):
+        self.assertFalse(fork.is_temp_artifact(r"D:\code\workbuddy-fork\scripts\fork.py"))
+        self.assertFalse(fork.is_temp_artifact(r"D:\code\workbuddy-fork\AGENTS.md"))
+
+    def test_导出目录里的不算改过的文件(self):
+        self.assertTrue(fork.is_temp_artifact(str(fork.TEMP_ROOT / "abc-from1.md")))
+
+    def test_上次留下的包不算改过的文件(self):
+        self.assertTrue(fork.is_temp_artifact(r"C:\somewhere\abc-package.md"))
+
+    def test_改过的文件那一节列得出仓库里的改动(self):
+        target = r"D:\code\workbuddy-fork\scripts\fork.py"
+        turns = [{
+            "user": "x", "blocks": [], "errors": [], "ts": 1,
+            "calls": [
+                {"name": "Edit", "args": {"file_path": target}},
+                {"name": "Edit", "args": {"file_path": target}},
+                {"name": "Write", "args": {"file_path": str(fork.TEMP_ROOT / "p.md")}},
+            ],
+        }]
+        facts = fork.collect_facts(turns)
+        self.assertEqual(facts["edited"], [(target, 2)])
+
+
 class 碎片判据(unittest.TestCase):
     """整段只剩协议碎片才清掉。判据是「整段被一个已知标签包住」。"""
 

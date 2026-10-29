@@ -663,11 +663,19 @@ def file_arg(args: dict) -> str:
 
 
 def is_temp_artifact(path: str) -> bool:
-    """上一次跑脚本留下的临时文件,别让它冒充「改过的文件」。"""
-    s = path.replace("\\", "/")
-    if "/workbuddy-fork/" in s:
-        return True
-    return bool(re.search(r"-(?:package|from\d+(?:-package)?)\.md$", s))
+    """上一次跑脚本留下的临时文件,别让它冒充「改过的文件」。
+
+    判据是「在不在临时导出目录里」,而不是「路径里有没有 workbuddy-fork」——
+    这个仓库自己就叫这个名字,按名字判会把它下面改过的文件全滤掉,
+    「改过的文件」那一节永远空着,而包照常交付、看不出来。
+    """
+    p = Path(path)
+    try:
+        if p.resolve().is_relative_to(TEMP_ROOT):
+            return True
+    except (OSError, ValueError):
+        pass
+    return bool(re.search(r"-(?:package|from\d+(?:-package)?)\.md$", p.as_posix()))
 
 
 def collect_facts(turns):
