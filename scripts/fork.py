@@ -40,8 +40,13 @@ IMAGE_PATH_RE = re.compile(r"<image_local_path>([^<]+)</image_local_path>")
 # 去抓,整句话都会当成文件名删掉。宁可丢一个中文文件名,也不能吃用户的话。
 NAME_CHARS = r"[A-Za-z0-9_./\\:\-~%+=@]"
 AT_IMAGE_RE = re.compile(rf"@image#?\d*:({NAME_CHARS}+)")
-AT_MARK_RE = re.compile(rf'@(?:long-text|file|skill|image)#?\d*:(?:"[^"]*"|{NAME_CHARS}*)\s*')
-AT_FILE_RE = re.compile(rf'@(?:file|skill)#?\d*:(?:"([^"]*)"|({NAME_CHARS}+))')
+AT_MARK_RE = re.compile(rf'@(?:long-text|image)#?\d*:(?:"[^"]*"|{NAME_CHARS}*)\s*')
+
+# @skill: / @file: 是「用户当时点了哪个技能、哪个文件」的唯一记录。
+# 删掉它等于抹掉「这句话是 /code-review 触发的」——而这件事在新对话里
+# 没有任何文件能查回来,只能靠上下文包自己说。
+SKILL_MARK_RE = re.compile(rf'@skill#?\d*:(?:"([^"]*)"|({NAME_CHARS}+))')
+FILE_MARK_RE = re.compile(rf'@file#?\d*:(?:"([^"]*)"|({NAME_CHARS}+))')
 
 # 摘要类注入:里面是历史重放,先整块删掉,再谈别的
 SUMMARY_BLOCKS = ["cb_summary", "conversation_history_summary"]
@@ -261,6 +266,32 @@ def msg_text(record) -> str:
     return "\n".join(part_text(p) for p in content if part_text(p))
 
 
+def marker_name(raw: str) -> str:
+    """把标记里的路径缩成一个能看懂的名字。"""
+    raw = raw.strip()
+    parts = [p for p in re.split(r"[\\/]", raw) if p]
+    if not parts:
+        return raw
+    # @skill:"…/writing-for-agents/SKILL.md" 里,技能名是目录名,不是 SKILL.md
+    if parts[-1].lower() in ("skill.md", "skill.markdown") and len(parts) >= 2:
+        return parts[-2]
+    return parts[-1]
+
+
+def render_markers(text: str) -> str:
+    """把 @skill: / @file: 换成看得见的占位,而不是删掉。
+
+    这两样记的是「用户点了什么」。技能名一旦抹掉,新对话就看不出这句话
+    是普通请求还是 `/code-review`、`/to-spec` 触发的——而这决定了它该不该
+    按那套流程办事。仓库里查不到这条,只能靠包自己保留。
+    """
+    text = SKILL_MARK_RE.sub(
+        lambda m: f"[技能 {marker_name(m.group(1) or m.group(2))}]", text)
+    text = FILE_MARK_RE.sub(
+        lambda m: f"[文件 {marker_name(m.group(1) or m.group(2))}]", text)
+    return text
+
+
 def drop_tag_blocks(text: str, tags) -> str:
     """整块删掉一批已知标签连同内容。"""
     for tag in tags:
@@ -299,6 +330,7 @@ def clean_outer(outer: str):
     outer = REMINDER_RE.sub("", outer)
     outer = drop_tag_blocks(outer, SUMMARY_BLOCKS)
     outer = drop_tag_blocks(outer, INJECTED_BLOCKS)
+    outer = render_markers(outer)
     outer = AT_MARK_RE.sub("", outer)
     # 先收紧空白再匹配:NOISE_RES 的 ^ 锚点,前面多一个空行就没命中,
     # 那些 harness 指令会当成用户发言混进 outline。
@@ -315,22 +347,18 @@ def clean_outer(outer: str):
 
 
 def clean_body(body: str):
-    """清理 <user_query> 体内,返回 (正文, 图片路径, 图片名, 附件名)。
+    """清理 <user_query> 体内,返回 (正文, 图片路径, 图片名)。
 
     体内是用户原话——包括他 @long-text 粘进来的代码、他贴出来讨论的标签本身
     ——所以只摘附件、不碰排版。缩进和空行原样留着,代码块和栈才不会压平。
 
-    允许剥的只有两样:带 data-role 的 system-reminder 和 image_local_path。
-    它们是平台拼进来的,用户不会手打。
+    允许"删"的只有 image_local_path 和带 data-role 的 system-reminder,
+    它们是平台拼进来的。@skill / @file 不删,换成看得见的占位。
     """
     paths = [p.strip() for p in IMAGE_PATH_RE.findall(body)]
     names = AT_IMAGE_RE.findall(body)
-    files = []
-    for quoted, bare in AT_FILE_RE.findall(body):
-        name = quoted or bare
-        if name:
-            files.append(short_img(name))
 
+    body = render_markers(body)
     body = AT_MARK_RE.sub("", body)
     body = IMAGE_PATH_RE.sub("", body)
     body = re.sub(r'<system-reminder\s+data-role="[^"]*"[\s\S]*?</system-reminder>', "", body)
@@ -340,7 +368,7 @@ def clean_body(body: str):
     body = re.sub(r"\n{3,}", "\n\n", body).strip()
     # 标记剥掉后开头会留一个孤零零的逗号
     body = body.lstrip("，,、;；:：").strip()
-    return body, paths, names, files
+    return body, paths, names
 
 
 def clean_user(text: str) -> str:
@@ -360,14 +388,11 @@ def clean_user(text: str) -> str:
 
     texts = []
     for body in parts[1::2]:
-        cleaned, body_paths, body_names, files = clean_body(body)
+        cleaned, body_paths, body_names = clean_body(body)
         paths.extend(body_paths)
         names.extend(body_names)
         if cleaned:
             texts.append(cleaned)
-        elif files:
-            # 只发了附件、一句话没说的消息也要留个位置,否则轮次编号会整体错位
-            texts.append("附件:" + "、".join(files))
     if remaining:
         texts.append(remaining)
 
