@@ -33,14 +33,28 @@ PROJECTS_DIR = WB_HOME / "projects"
 TEMP_ROOT = Path(tempfile.gettempdir()).resolve() / "workbuddy-fork"
 
 REMINDER_RE = re.compile(r"<system-reminder[\s\S]*?</system-reminder>")
+
+# 「这串东西在行内代码里」只有这一条判据,三处共用。用户讨论这个工具时,
+# 必然要把 `<user_query>`、`@image#1:a.png` 写成字面文本;认了它们,切分就会
+# 从错误的位置开始——注入被当原话、原话被当注入(ADR-0004)。
+NOT_IN_CODE_LEFT = r"(?<![`])"
+NOT_IN_CODE_RIGHT = r"(?![`])"
+
+
+def in_inline_code(text: str, pos: int) -> bool:
+    """pos 紧跟在反引号后面,说明这一处在行内代码里。"""
+    return pos > 0 and text[pos - 1] == "`"
+
+
 # 带 data-role 的 system-reminder 整块是平台拼的信封。必须在切体内外之前剥掉:
 # AGENTS.md 会被整篇注进 user-context,而它里面就写着 `<user_query>` 这条纪律,
 # 留着信封,非贪婪的 QUERY_RE 就会从那个字面标签开始匹配到真闭合标签——
 # 前半段注入变成「体内」、真原话变成「体外」。
 ENVELOPE_RE = re.compile(r'<system-reminder\s+data-role="[^"]*"[\s\S]*?</system-reminder>')
-# 标签被反引号包着时不算结构:用户讨论它们时会写成内联代码,那不是发言边界。
-# 两头都要判——只判开标签,非贪婪就会从真开标签一路吃到反引号里的假闭合。
-QUERY_RE = re.compile(r"(?<![`])<user_query>([\s\S]*?)</user_query>(?![`])")
+# 标签被反引号包着时不算结构。两头都要判——只判开标签,非贪婪就会从真开标签
+# 一路吃到反引号里的假闭合。
+QUERY_RE = re.compile(
+    rf"{NOT_IN_CODE_LEFT}<user_query>([\s\S]*?)</user_query>{NOT_IN_CODE_RIGHT}")
 IMAGE_PATH_RE = re.compile(r"<image_local_path>([^<]+)</image_local_path>")
 
 # 标记名的字符集只收 ASCII。看起来苛刻,但这是唯一不会吃正文的写法:
@@ -50,7 +64,7 @@ NAME_CHARS = r"[A-Za-z0-9_./\\:\-~%+=@]"
 # 反引号里的是用户在正文里举例讨论这个标记,不是附件。判据看位置、
 # 不看「有没有 <image_local_path>」:平台偶尔漏记路径,但图确实贴了,
 # 按路径判会把真附件当成讨论原样丢给新对话。
-AT_IMAGE_RE = re.compile(rf"(?<![`])@image#?\d*:({NAME_CHARS}+)")
+AT_IMAGE_RE = re.compile(rf"{NOT_IN_CODE_LEFT}@image#?\d*:({NAME_CHARS}+)")
 
 # 两种标记共用一套语法,所以只认一遍:改一处就不会漏另一处。
 # 分组:1 = 标记种类,2 = 引号里的内容,3 = 裸路径,4 = 后面跟的空白。
@@ -353,7 +367,7 @@ def render_marks(text: str) -> str:
             # 反引号里的是用户在正文里举例讨论它,原样留着;否则是真附件,
             # 标记删掉,由 [图片 …] 占位补回来。删掉讨论用的那个,会留下
             # 空反引号,还会在消息开头凭空多出一个 [图片 …]。
-            if m.start() > 0 and text[m.start() - 1] == "`":
+            if in_inline_code(text, m.start()):
                 out.append(m.group(0))
             continue
 
@@ -482,7 +496,7 @@ def clean_body(body: str, refs=()):
     body = render_marks(body)
     body = render_file_refs(body, refs)
     body = IMAGE_PATH_RE.sub("", body)
-    body = re.sub(r'<system-reminder\s+data-role="[^"]*"[\s\S]*?</system-reminder>', "", body)
+    body = ENVELOPE_RE.sub("", body)
     # long_text_quote 是用户 @ 引用粘进来的正文,脱壳但正文留着
     body = re.sub(r"</?long_text_quote[^>]*>", "\n", body)
 

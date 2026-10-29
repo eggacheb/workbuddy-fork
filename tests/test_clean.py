@@ -224,6 +224,22 @@ class 体内外切分(unittest.TestCase):
         self.assertIn("是这个的问题吗", out)
         self.assertNotIn("@image", out)
 
+    def test_三个干扰叠在一起时原话仍然完整(self):
+        # 复刻全库那 5 条受损消息的形态:注入信封里有字面标签(AGENTS.md 原文)、
+        # 体外有反引号包住的一对、体内还有一处裸的假开标签。只修其中一个,
+        # 切分照样错——真实的坑从来不是单独出现的。
+        text = (
+            '<system-reminder data-role="user-context">\n'
+            '- **`<user_query>` 体内是用户原话。**\n'
+            '</system-reminder>\n'
+            '说明:真实输入取 `<user_query>…</user_query>` 里的内容。\n'
+            '<user_query>第一句。没有 <user_query> 的消息会走体外那条路。</user_query>'
+        )
+        out = fork.clean_user(text)
+        self.assertIn("第一句", out)
+        self.assertIn("没有 <user_query> 的消息会走体外那条路", out)
+        self.assertNotIn("体内是用户原话", out)   # 注入不能混进原话
+
 
 class 碎片判据(unittest.TestCase):
     """整段只剩协议碎片才清掉。判据是「整段被一个已知标签包住」。"""
