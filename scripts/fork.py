@@ -376,6 +376,10 @@ def clean_body(body: str):
 
     允许"删"的只有 image_local_path 和带 data-role 的 system-reminder,
     它们是平台拼进来的。@skill / @file / @long-text 不删,换成看得见的占位。
+
+    整段只有一个例外:体内除了一个已知协议标签什么都没有——那不是用户说的话。
+    判据和体外同一个 protocol_only,所以「帮我解释 <system-reminder>示例
+    </system-reminder> 是什么」这类讨论标签的原话不会被误伤:它整段不是被标签包住的。
     """
     paths = [p.strip() for p in IMAGE_PATH_RE.findall(body)]
     names = AT_IMAGE_RE.findall(body)
@@ -394,6 +398,10 @@ def clean_body(body: str):
     body = re.sub(r"\n{3,}", "\n\n", body).strip()
     # 标记剥掉后开头会留一个孤零零的逗号
     body = body.lstrip("，,、;；:：").strip()
+    # 剥完只剩一个协议标签,说明这一轮用户其实没说话。留着它会凭空多出一条
+    # 发言,把后面所有编号顶掉,--from N 从此指错地方。
+    if protocol_only(body):
+        body = ""
     return body, paths, names
 
 

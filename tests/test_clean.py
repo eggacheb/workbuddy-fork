@@ -88,6 +88,19 @@ class 碎片判据(unittest.TestCase):
         self.assertIn("帮我解释", out)
         self.assertIn("是什么", out)
 
+    def test_体内只剩一个已知标签时不算用户发言(self):
+        # 一条只装着平台注入的 <user_query> 不是用户说的话。原来体内不过碎片判据,
+        # 它会变成一条凭空多出来的发言,把后面所有编号顶掉,--from N 从此指错地方。
+        self.assertEqual(
+            fork.clean_user("<user_query><system-reminder>sys</system-reminder></user_query>"),
+            "")
+
+    def test_体内只剩标签但标签出现两次时仍是用户发言(self):
+        # 同一个标签出现两次,说明中间夹着正文——那是用户在讨论这个标签。
+        out = fork.clean_user(
+            "<user_query><system-reminder>a</system-reminder>这里<system-reminder>b</system-reminder></user_query>")
+        self.assertIn("这里", out)
+
 
 class 排版(unittest.TestCase):
     def test_体内缩进原样保留(self):

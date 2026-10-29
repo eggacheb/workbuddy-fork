@@ -204,6 +204,45 @@ class 编码(unittest.TestCase):
         self.assertIn("还能读到这句", out_text(r))
 
 
+class 幽灵发言(unittest.TestCase):
+    """只装着平台注入的 user_query 不能占掉一个编号。"""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.home = Path(self._tmp.name)
+        recs = [
+            support.ai_title("幽灵发言"),
+            support.user_turn(1, "真问题一"),
+            support.assistant_turn(1, "回答一"),
+            support.user_turn(2, "<user_query><system-reminder>平台注入</system-reminder></user_query>"),
+            support.assistant_turn(2, "回答二"),
+            support.user_turn(3, "真问题二"),
+            support.assistant_turn(3, "回答三"),
+        ]
+        support.write_session(self.home, recs, "sess0001")
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_outline里只剩两条真空发言(self):
+        r = run_cli("--outline", "-s", "sess0001", home=self.home)
+        self.assertEqual(r.returncode, 0, err_text(r))
+        out = out_text(r)
+        self.assertIn("共 2 个用户发言", out)
+        self.assertRegex(out, r"\[\s*2\]\s*真问题二")
+        self.assertNotIn("平台注入", out)
+
+    def test_from按真空发言计数(self):
+        # 编号一旦被幽灵发言顶掉,--from 2 会指到一条不存在的话上
+        r = run_cli("--from", "2", "--stdout", "-s", "sess0001", home=self.home)
+        self.assertEqual(r.returncode, 0, err_text(r))
+        out = out_text(r)
+        self.assertIn("[2] 用户", out)
+        self.assertIn("真问题二", out)
+        self.assertNotIn("真问题一", out)
+        self.assertNotIn("[3] 用户", out)
+
+
 class 参数互斥(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
