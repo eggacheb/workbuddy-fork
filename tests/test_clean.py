@@ -4,7 +4,10 @@
 照常输出、退出码 0,只有人肉比对原文才看得出来——所以必须钉成用例。
 """
 
+import tempfile
 import unittest
+from pathlib import Path
+from unittest import mock
 
 import support  # noqa: F401  设好 WORKBUDDY_HOME 并挂上 scripts/
 import fork
@@ -124,6 +127,30 @@ class 引号形式的文件引用(unittest.TestCase):
         self.assertNotIn("Note: These references", out)
 
 
+class 包的识别(unittest.TestCase):
+    """按开头认包,但导出文件的第一行固定是 `# 会话记录:`——先排除它。"""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self._tmp.name)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_读不出来的包仍认作包(self):
+        # 被占用、没权限时读不到开头。判成「不是包」正好会让正文盖掉
+        # 用户手填的那一份,而「已导出」还会照常打印。
+        p = self.dir / "abc-package.md"
+        p.write_text("x", encoding="utf-8")
+        with mock.patch.object(Path, "read_text", side_effect=OSError("被占用")):
+            self.assertTrue(fork.looks_like_package(p))
+
+    def test_开头是会话记录的一律不是包(self):
+        p = self.dir / "x-full.md"
+        p.write_text("# 会话记录:某条线\n\n## 之前那条线到哪了\n人话\n", encoding="utf-8")
+        self.assertFalse(fork.looks_like_package(p))
+
+
 class 临时文件判据(unittest.TestCase):
     """这个仓库自己就叫 workbuddy-fork,按名字判会把它的文件全滤掉。"""
 
@@ -198,6 +225,18 @@ class 排版(unittest.TestCase):
         out = fork.clean_user(f"<user_query>{body}</user_query>")
         self.assertIn("    def f():", out)
         self.assertIn("        return 1", out)
+
+    def test_连续空行原样保留(self):
+        # 用户贴进来的终端输出、markdown 原文里,空行就是内容。压空行不压缩进,
+        # 所以压不平代码块——但它仍然在改用户的原话,而这一类改动不会报错。
+        body = "先说结论:\n\n\n\n```python\nx = 1\n```"
+        out = fork.clean_user(f"<user_query>{body}</user_query>")
+        self.assertIn("先说结论:\n\n\n\n```python", out)
+
+    def test_代码块里的空行不被压缩(self):
+        body = "```\n调一下这里\n\n\n\n再看这里\n```"
+        out = fork.clean_user(f"<user_query>{body}</user_query>")
+        self.assertIn("调一下这里\n\n\n\n再看这里", out)
 
     def test_摘要块里的假原话不算这一轮说的话(self):
         # <cb_summary> 里嵌着上一轮的 <user_query>,那是历史重放。

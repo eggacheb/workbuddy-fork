@@ -88,6 +88,27 @@ class 上下文包不被正文覆盖(_TempHome):
         self.assertIn("上下文包本身", err_text(r))
         self.assertIn("手填的东西", renamed.read_text(encoding="utf-8"))
 
+    def test_导出文件里出现包的小节名时不算包(self):
+        # 导出文件里可能就有「## 之前那条线到哪了」——用户把包贴进了新对话,
+        # 那句话又落回了正文。旧判据按开头认包,于是同一个文件名第二次导出被
+        # 永久挡住:失败得安全,但把正常操作也挡了。
+        recs = [support.ai_title("第二次导出"),
+                support.user_turn(1, "接着做 demo。\n\n## 之前那条线到哪了\n这里是人话"),
+                support.assistant_turn(1, "好")]
+        support.write_session(self.home, recs, "export2")
+        out_file = self.out / "xxx-full.md"
+
+        r1 = run_cli("--out", str(out_file), "-s", "export2", home=self.home)
+        self.assertEqual(r1.returncode, 0, err_text(r1))
+        doc = out_file.read_text(encoding="utf-8")
+        # 前提:这份导出确实踩在旧判据的坑上
+        self.assertTrue(doc.startswith("# 会话记录:"))
+        self.assertIn("## 之前那条线到哪了", doc[:400])
+
+        r2 = run_cli("--out", str(out_file), "-s", "export2", home=self.home)
+        self.assertEqual(r2.returncode, 0, err_text(r2))
+        self.assertNotIn("上下文包本身", err_text(r2))
+
     def test_已有包默认不覆盖(self):
         r = run_cli("--package", "--out", str(self.out / "原文.md"), "-s", self.sid, home=self.home)
         self.assertEqual(r.returncode, 0, err_text(r))
@@ -159,6 +180,44 @@ class 会话定位(unittest.TestCase):
         r = run_cli("--stdout", "-s", real_id, home=self.home)
         self.assertEqual(r.returncode, 0, err_text(r))
         self.assertIn("反查测试", out_text(r))
+
+    def test_文件名对不上时来源会话写的是真ID(self):
+        # find_by_content 按日志里的 sessionId 反查到了文件,但文件名是另一回事。
+        # 「来源会话」照抄文件名的话,新对话拿这个 ID 回头查就落空,而且看不出错。
+        real_id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+        recs = [
+            {"type": "session-meta", "timestamp": 0, "sessionId": real_id},
+            support.ai_title("反查命中的会话"),
+            support.user_turn(1, "反查测试"),
+            support.assistant_turn(1, "好"),
+        ]
+        support.write_session(self.home, recs, session_id="other-file-name")
+        out_file = self.home / "a.md"
+        r = run_cli("--out", str(out_file), "-s", real_id, home=self.home)
+        self.assertEqual(r.returncode, 0, err_text(r))
+        doc = out_file.read_text(encoding="utf-8")
+        self.assertIn(f"- 会话 ID:`{real_id}`", doc)
+        self.assertNotIn("other-file-name", doc)
+
+        # 文件名口径不动:包名照旧按日志文件名,否则老版本手填的那份包会
+        # 「看不见」——「已有的包默认不覆盖」就名存实亡了。
+        r2 = run_cli("--package", "--out", str(out_file), "-s", real_id, home=self.home)
+        self.assertEqual(r2.returncode, 0, err_text(r2))
+        pkg = self.home / "other-file-name-package.md"
+        self.assertTrue(pkg.is_file(), sorted(p.name for p in self.home.iterdir()))
+        self.assertIn(f"来源会话 `{real_id}`", pkg.read_text(encoding="utf-8"))
+
+    def test_日志里没有sessionId时退回文件名并标明(self):
+        # 有的日志格式里根本没有 sessionId 字段。退回 path.stem 可以,
+        # 但必须让读包的人看出来这个 ID 是文件名顶上去的,不是日志自己说的。
+        support.simple_session(self.home, n=1)
+        out_file = self.home / "a.md"
+        r = run_cli("--out", str(out_file), "-s", "sess0001", home=self.home)
+        self.assertEqual(r.returncode, 0, err_text(r))
+        doc = out_file.read_text(encoding="utf-8")
+        self.assertIn("- 会话 ID:`sess0001`", doc)
+        self.assertIn("按文件名", doc)
+        self.assertIn("按文件名", err_text(r))
 
     def test_list列得出会话(self):
         sid = support.simple_session(self.home, n=1)
@@ -333,6 +392,15 @@ class 出包(_TempHome):
         self.assertIn(f"来源会话 `{self.sid}`", out)
         self.assertIn(r"工作目录 `D:\code\demo`", out)
         self.assertIn("<!--", out)
+
+    def test_包里的来源会话也标明ID是文件名凑的(self):
+        # 包是真正被粘进新对话的那一份,header 只陪跑。ID 是猜的这件事,
+        # 包里不写清楚,下一轮的 agent 会拿着假 ID 去查。
+        r = run_cli("--package", "--out", str(self.out / "原文.md"), "-s", self.sid, home=self.home)
+        self.assertEqual(r.returncode, 0, err_text(r))
+        pkg = (self.out / f"{self.sid}-package.md").read_text(encoding="utf-8")
+        self.assertIn(f"来源会话 `{self.sid}`", pkg)
+        self.assertIn("按文件名", pkg)
 
     def test_全量导出的包名不带from(self):
         r = run_cli("--package", "--out", str(self.out / "原文.md"), "-s", self.sid, home=self.home)

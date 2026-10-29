@@ -231,6 +231,19 @@ def read_title_file(path: Path, max_lines: int = 2000) -> str:
     return ""
 
 
+def read_session_id(records) -> str:
+    """日志自己记的会话 ID,取不到返回空串。
+
+    文件名叫什么不算数:接续会话、子代理会话的日志文件名和日志里的 sessionId
+    并不是一回事。包里的「来源会话」是给新对话回头查用的,填错等于给个假线索。
+    """
+    for r in records:
+        v = r.get("sessionId")
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+    return ""
+
+
 def read_cwd(records) -> str:
     """取被导出会话自己的工作目录——不是当前会话的。
 
@@ -458,7 +471,12 @@ def clean_body(body: str, refs=()):
     # long_text_quote 是用户 @ 引用粘进来的正文,脱壳但正文留着
     body = re.sub(r"</?long_text_quote[^>]*>", "\n", body)
 
-    body = re.sub(r"\n{3,}", "\n\n", body).strip()
+    # 这里刻意不压空行。压的是空行不是缩进,所以压不平代码块——但用户贴进来的
+    # 终端输出、markdown 原文里,空行本身是内容。`\n{3,}` → `\n\n` 属于「顺手」
+    # 那类改动:不报错、不崩,只是内容悄悄变了。代价实测过(见 ADR-0003):
+    # 全库 2156 条发言里只有 27 条的正文含 3 连以上空行,换来的是一句能说清的
+    # 规则——体内除了平台拼进来的东西和首尾空白,字节一律不动。
+    body = body.strip()
     # 标记剥掉后开头会留一个孤零零的逗号
     body = body.lstrip("，,、;；:：").strip()
     # 剥完只剩一个协议标签,说明这一轮用户其实没说话。留着它会凭空多出一条
@@ -795,6 +813,16 @@ def render_facts(facts, base=""):
 
 # ---------- 输出 ----------
 
+# 日志里没有 sessionId 时,ID 是文件名顶上去的。交付物里必须标出来,否则
+# 「日志自己说的」和「我们按文件名猜的」在纸面上长得一模一样。
+ID_GUESS_NOTE = "(日志里没有 sessionId,按文件名填)"
+
+
+def id_note(meta) -> str:
+    """ID 是猜的就带上说明。header 和包里的「来源会话」都用它,免得各写各的。"""
+    return ID_GUESS_NOTE if meta.get("id_from_filename") else ""
+
+
 def render_turns(turns, start=1, end=None, compact=False):
     last = end if end is not None else len(turns)
     parts = []
@@ -849,7 +877,8 @@ def package_skeleton(meta, facts):
         "",
         "## 关键事实",
         "<!-- 以下由脚本从日志机械提取,可直接删改 -->",
-        f"- 来源会话 `{meta['session_id']}`,第 {meta['start']} ~ {meta['end']} 个用户发言(共 {meta['total']} 个)",
+        f"- 来源会话 `{meta['session_id']}`{id_note(meta)}"
+        f",第 {meta['start']} ~ {meta['end']} 个用户发言(共 {meta['total']} 个)",
     ]
     if meta.get("project_dir"):
         lines.append(f"- 工作目录 `{meta['project_dir']}`")
@@ -878,20 +907,33 @@ def read_text_any(path: Path):
     return raw.decode("utf-8", errors="replace"), None
 
 
+# 导出文件的第一行固定是它。认「这是不是包」之前先拿它排除「这是自己写出去的
+# 东西」:导出正文里可能就带着包的小节名(用户把包贴回新对话,那句话又落进正文),
+# 不先排除的话,同一个文件名第二次导出会被认成包,永久挡住。
+EXPORT_HEAD = "# 会话记录:"
+
+
 def looks_like_package(path: Path) -> bool:
     """这个路径是不是一份上下文包?
 
-    按名字认是主判据(`<会话ID>[-fromN]-package.md`),再按开头认一遍——
+    先排除「这是导出」——包里永远没有 `# 会话记录:` 这一行,导出一定有。
+    这一步必须排在按开头认包之前,否则导出的正文会把判据骗过去。
+
+    剩下的按名字认(`<会话ID>[-fromN]-package.md`),再按开头认一遍——
     用户可能把包另存成了别的名字,而那是他手填的唯一副本。
     """
     if not path.is_file():
         return False
-    if path.name.endswith("-package.md"):
-        return True
     try:
         head = path.read_text(encoding="utf-8", errors="replace")[:400]
     except OSError:
+        # 读不出来(被占用、没权限)不能因此判成「不是包」——那正好会让正文
+        # 盖掉用户手填的那一份。退回按名字判:宁可多挡一次。
+        return path.name.endswith("-package.md")
+    if head.lstrip("\ufeff \t\r\n").startswith(EXPORT_HEAD):
         return False
+    if path.name.endswith("-package.md"):
+        return True
     return "<!-- 填完删" in head or "## 之前那条线到哪了" in head
 
 
@@ -1067,6 +1109,12 @@ class Session:
     records: list
     turns: list
     title: str
+    # 日志文件名,只用来给导出的文件起名。文件名不等于会话 ID,而「已有的包
+    # 不覆盖」这条保证靠的就是名字稳定——口径换了,老版本手填的包会看不见。
+    stem: str
+    # 日志里没有 sessionId,id 是文件名顶上去的。交付物里要标出来,
+    # 否则读包的人分不清「日志说的 ID」和「我们猜的 ID」。
+    id_from_filename: bool = False
 
 
 def open_session(args):
@@ -1090,7 +1138,21 @@ def open_session(args):
         print("如果日志不是 WorkBuddy 格式(比如装进了 Claude Code),提取会全部落空。", file=sys.stderr)
         return None, 2
 
-    return Session(path.stem, records, turns, read_title(records)), 0
+    sid, guessed = session_identity(path, records)
+    if guessed:
+        print(f"(日志里没有 sessionId,来源会话按文件名填:{path.name})", file=sys.stderr)
+    elif sid != path.stem:
+        # 用户拿文件名当 ID 找过来,header 里却是另一个 ID。不吭一声的话,
+        # 两处对不上看着就像脚本写错了。
+        print(f"(日志里的 sessionId 是 {sid},和文件名 {path.stem} 不一致;来源会话按日志写)",
+              file=sys.stderr)
+    return Session(sid, records, turns, read_title(records), path.stem, guessed), 0
+
+
+def session_identity(path: Path, records):
+    """(会话 ID, 是不是按文件名凑的)。取不到真正的 ID 才退回文件名。"""
+    real = read_session_id(records)
+    return (real, False) if real else (path.stem, True)
 
 
 def cmd_outline(turns, title, session_id) -> int:
@@ -1178,9 +1240,9 @@ def is_partial(meta) -> bool:
 def document_header(meta, calls, compact):
     """导出的文件头。meta 里的会话 ID / 工作目录 / 时间跨度是模型猜不出来的真事实。"""
     lines = [
-        f"# 会话记录:{meta['title'] or '(无标题)'}",
+        f"{EXPORT_HEAD}{meta['title'] or '(无标题)'}",
         "",
-        f"- 会话 ID:`{meta['session_id']}`",
+        f"- 会话 ID:`{meta['session_id']}`{id_note(meta)}",
         f"- 工作目录:`{meta['project_dir'] or '未知'}`",
         f"- 时间:{meta['span']}",
         f"- 全量:用户发言 {meta['total']} 次,工具调用 {calls} 次",
@@ -1194,9 +1256,13 @@ def document_header(meta, calls, compact):
 
 
 def package_path_for(out_path: Path, meta) -> Path:
-    """包和正文落在同一个目录,靠名字区分。分段导出才带 -fromN。"""
+    """包和正文落在同一个目录,靠名字区分。分段导出才带 -fromN。
+
+    名字用日志文件名而不是会话 ID:同一个会话每轮导出要落到同一份包上,
+    「已有的包默认不覆盖」才成立。两者不一致时优先照顾这条。
+    """
     suffix = f"-from{meta['start']}" if is_partial(meta) else ""
-    return out_path.parent / f"{meta['session_id']}{suffix}-package.md"
+    return out_path.parent / f"{meta['file_stem']}{suffix}-package.md"
 
 
 def warn_too_long(compact, start):
@@ -1283,6 +1349,8 @@ def main():
     calls = sum(1 for r in sess.records if r.get("type") == "function_call")
     meta = {
         "session_id": sess.id,
+        "file_stem": sess.stem,
+        "id_from_filename": sess.id_from_filename,
         "title": sess.title,
         "project_dir": read_cwd(sess.records),
         "start": start,
@@ -1299,7 +1367,7 @@ def main():
         sys.stdout.write(doc)
         return 0
 
-    out_path = Path(args.out) if args.out else TEMP_ROOT / f"{sess.id}-from{start}.md"
+    out_path = Path(args.out) if args.out else TEMP_ROOT / f"{sess.stem}-from{start}.md"
     pkg_path = package_path_for(out_path, meta)
     code = write_export(out_path, pkg_path, doc, meta, calls, args.compact)
     if code:
