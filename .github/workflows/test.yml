@@ -1,0 +1,20 @@
+name: test
+
+# 这个仓库历史上的 P0 全是「照常打印已导出、退出码 0、内容是错的」。
+# 用例只有在有人跑的时候才是护栏,所以放在 push 上强制执行。
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    # 必须跑 Windows:中文管道编码那条用例只有在 Windows 上才有意义
+    # (gbk 输出流 + 被接走的 stdout)。
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: 全量测试
+        run: python -m unittest discover -s tests -v

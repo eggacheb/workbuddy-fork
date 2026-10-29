@@ -18,12 +18,18 @@
 ## 跑起来
 
 ```bash
-python scripts/fork.py --outline            # 列当前会话的用户发言,挑分叉点
-python scripts/fork.py --compact --package  # 导出 + 出包骨架
-python -m unittest discover -s tests -v     # 全部测试
+python scripts/fork.py --outline                # 列当前会话的用户发言,挑分叉点
+python scripts/fork.py --compact --package      # 导出 + 出包骨架
+python -m unittest discover -s tests -v         # 全部测试
+python scripts/corpus_check.py                  # 全库回归:发言数 / 占位数 / 整条丢掉数
+python scripts/corpus_check.py --equiv HEAD~1   # 和旧版逐字节比输出,证明改动等价
 ```
 
-会话日志在 `~/.workbuddy/projects/<项目slug>/<sessionId>.jsonl`,目录可用 `WORKBUDDY_HOME` 覆盖。**测试全部靠这个变量指到临时 fixture,绝不读真实会话**——否则测试结果取决于这台机器上聊过什么。
+单测只覆盖想得到的边界;**`corpus_check` 跑的是这台机器上真实发生过的全部会话**。改完剥离规则先跑它,再看数字有没有掉。它也可以 `--save` 存基线、`--compare` 再比,任何一项变少都算回归。
+
+会话日志在 `~/.workbuddy/projects/<项目slug>/<会话Id>.jsonl`,目录可用 `WORKBUDDY_HOME` 覆盖。测试全部靠这个变量指到临时 fixture,**绝不读真实会话**——否则结果取决于这台机器上聊过什么。
+
+`pre-commit` 在提交前跑全量测试,不过就拦下(`scripts/sync-skill.sh --install-hooks` 装的)。CI 跑同一份,runner 用 `windows-latest`:中文管道编码那条用例只有在 Windows 上才有意义。
 
 改完 clone 里的代码要同步到 WorkBuddy 实际加载的 `~/.workbuddy/skills/fork/`:`scripts/sync-skill.sh`。`post-commit` / `post-merge` 钩子会自动跑它(装钩子:`scripts/sync-skill.sh --install-hooks`)。**不同步就是跑旧代码,而且没有任何提示。**
 
@@ -32,12 +38,12 @@ python -m unittest discover -s tests -v     # 全部测试
 这几条都是踩出来的,不是风格偏好。
 
 - **静默错数据比崩溃严重。** 这个脚本历史上每一个 P0 都是「照常打印已导出,退出码 0,但内容是错的」。崩溃会被人发现,错数据不会。新增任何剥离规则,先问:它会不会顺手删掉真信息?
-- **判据要机械,不靠语义猜。** 「剥噪音」和「删真信息」的边界必须落在一个可验证的字符串条件上,例如「同一个 `<user_query>` 体内有没有 `<long_text_quote>`」。猜语义的规则一定会误伤。
+- **判据要机械,而且按位置判。** 「剥噪音」和「删真信息」的边界必须落在一个可验证的字符串条件上,条件还要**逐个标记判、不按整段判**:「从这个 `@long-text` 到下一个标记之间有没有 `<long_text_quote>`」,而不是「这一段里有没有」。按整段判,一个真引用会把同一句里讨论用的标记一起带走。
 - **`<user_query>` 体内是用户原话。** 只摘附件、不碰排版。缩进和空行必须原样留着,否则代码块对齐和 Node 栈的层级会被压平。
 - **标记名的字符集只收 ASCII。** 中文正文常紧贴标记(`@image#1:a.png，这样改对不对`),按「到空白为止」去抓会把整句话当文件名删掉。宁可丢一个中文文件名,也不能吃用户原话。
 - **用户点过的东西不能删。** `@skill:` / `@file:` / `@long-text:` 记的是「这句话是怎么来的」,新对话在仓库里查不回来,所以渲染成 `[技能 X]` / `[文件 y]` / `[长引用 「X」]` 而不是清掉。
 - **会话定位不猜。** ID 对不上就报错并列出最近的会话,`--newest` 才显式降级。悄悄换成别的会话,用户从输出里看不出来。
-- **改 `main()` 前先让测试全绿。** 它是单文件里最长的一段,塞着参数解析、会话定位、区间计算、header 拼装、写盘、出包。两次「顺手重构」都撞了回归。
+- **动一大段之前先补表征测试。** 把要改的行为先钉成用例再动手,这只为「改的时候立刻知道撞到哪」;提交前那道测试闸是另一回事,别拿它当理由跳过这一步。
 
 ## Agent skills
 

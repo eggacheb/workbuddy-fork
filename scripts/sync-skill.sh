@@ -31,6 +31,23 @@ HOOK
         chmod +x "$hook_dir/$hook"
         echo "已装钩子:${hook}"
     done
+
+    # 提交前跑测试。这个仓库历史上的 P0 全是「照常打印已导出、退出码 0、内容错的」,
+    # 没有这道闸,用例就只是一份文档。
+    cat >"$hook_dir/pre-commit" <<'HOOK'
+#!/usr/bin/env bash
+# 提交前跑全量测试。不过就拦下提交。
+# 确实要跳过(比如只改了文档):git commit --no-verify
+root="$(git rev-parse --show-toplevel 2>/dev/null)" || exit 0
+[ -d "$root/tests" ] || exit 0
+python -m unittest discover -s "$root/tests" -q || {
+    echo "" >&2
+    echo "测试没过,提交已拦下。修完再提交;确实要跳过用 git commit --no-verify。" >&2
+    exit 1
+}
+HOOK
+    chmod +x "$hook_dir/pre-commit"
+    echo "已装钩子:pre-commit"
 }
 
 sync_once() {

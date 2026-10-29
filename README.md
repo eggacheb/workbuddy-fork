@@ -59,6 +59,19 @@ python -m unittest discover -s tests -v
 
 全是 `unittest`，不引第三方依赖。夹具用 `WORKBUDDY_HOME` 指到临时目录自己造 jsonl，**不读真实会话**——否则用例结果取决于这台机器上聊过什么。
 
+提交时 `pre-commit` 会跑一遍，过不了就拦下（`scripts/sync-skill.sh --install-hooks` 装的）；CI 用 `windows-latest` 跑同一份。
+
+还有一个只对开发者有意义的：
+
+```bash
+python scripts/corpus_check.py                  # 扫本机全部真实会话,报各项数字
+python scripts/corpus_check.py --save base.json # 存基线
+python scripts/corpus_check.py --compare base.json  # 改完之后比,任何一项变少就是回归
+python scripts/corpus_check.py --equiv HEAD~1   # 和旧版逐字节比输出,证明重构等价
+```
+
+单测覆盖不到「真实语料里有没有误伤」这件事——它只能靠真实会话。改完剥离规则跑一次，看 `计入发言` 有没有掉。
+
 ### 怎么让 AI 用上它
 
 装好之后**不需要额外配置**。WorkBuddy 启动时会把 `skills/` 下每个 `SKILL.md` 的 `description` 注入给模型，模型看到「分叉」「开分支」「把上下文带过去」这类说法就会自己去调用。
