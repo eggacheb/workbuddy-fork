@@ -37,6 +37,28 @@ Copy-Item -Recurse .\workbuddy-fork "$env:USERPROFILE\.workbuddy\skills\fork"
 
 重启 WorkBuddy。左侧技能面板里能看到 `fork` 就装好了。
 
+### 开发时：让 clone 的改动生效
+
+如果你有一份 clone、又在 `skills/` 下放了一份副本，**两处不会自动同步**——push 完忘了复制，跑的还是旧代码，而且没有任何提示。装一次钩子就解决：
+
+```bash
+cd <你的 clone>
+scripts/sync-skill.sh --install-hooks   # 装 post-commit / post-merge 钩子
+scripts/sync-skill.sh                   # 立刻同步一次
+```
+
+之后每次提交或合并，都会自动把 `SKILL.md` / `README.md` / `LICENSE` / `scripts/` 复制到 `~/.workbuddy/skills/fork/`（目标可用 `WORKBUDDY_SKILLS_DIR` 覆盖，改名/删掉的旧脚本也会一起清掉）。
+
+脚本改动立即生效；**`SKILL.md` 的 `description` 要重启 WorkBuddy 才会重新注入**。钩子不进版本库，换机器要重跑一次 `--install-hooks`。
+
+### 测试
+
+```bash
+python -m unittest discover -s tests -v
+```
+
+全是 `unittest`，不引第三方依赖。夹具用 `WORKBUDDY_HOME` 指到临时目录自己造 jsonl，**不读真实会话**——否则用例结果取决于这台机器上聊过什么。
+
 ### 怎么让 AI 用上它
 
 装好之后**不需要额外配置**。WorkBuddy 启动时会把 `skills/` 下每个 `SKILL.md` 的 `description` 注入给模型，模型看到「分叉」「开分支」「把上下文带过去」这类说法就会自己去调用。
@@ -122,6 +144,8 @@ AI：（读日志、剥注入、出包）
 **留在 `<user_query>` 里的会保留**，所以你真正的输入一句不丢。`<long_text_quote>`（你 `@` 引用粘进来的正文）只脱壳、内容留着。用户自己贴的 `<div>`、`<config>` 之类代码也不会被误伤——只剥白名单里的标签。
 
 **`@skill:` / `@file:` 会换成 `[技能 code-review]` / `[文件 y.py]`，不是删掉。** 它记的是「这句话当时是用哪个技能触发的」，删了之后新对话就看不出该按 `/code-review` 还是 `/to-spec` 的流程办事——而这件事仓库里查不到。
+
+**`@long-text:"预览"` 按「后面跟没跟引文块」分两种处理。** 跟着 `<long_text_quote>` 时，预览串就是正文前 20 字的重复，删掉；没跟引文块时，这串预览是这个引用留下的唯一痕迹，换成 `[长引用 「预览」]` 留着。判据是机械的（同一个 `<user_query>` 体内有没有引文块），不猜语义——否则用户在正文里讨论这个标记本身时，原话会被吃成一对空反引号。
 
 ### 3. 出骨架
 

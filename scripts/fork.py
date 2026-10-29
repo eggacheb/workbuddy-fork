@@ -42,6 +42,13 @@ NAME_CHARS = r"[A-Za-z0-9_./\\:\-~%+=@]"
 AT_IMAGE_RE = re.compile(rf"@image#?\d*:({NAME_CHARS}+)")
 AT_MARK_RE = re.compile(rf'@(?:long-text|image)#?\d*:(?:"[^"]*"|{NAME_CHARS}*)\s*')
 
+# @long-text 要单独处理,不能跟着 image 一起无条件删。
+# 后面跟着 <long_text_quote> 时,预览串是正文前 20 字的重复,删掉不丢信息;
+# 没跟引文块时,这串预览是这个引用留下的唯一痕迹——删了就只剩一对空反引号。
+# 判据是机械的(同一体内有没有引文块),不猜语义。
+LONG_TEXT_MARK_RE = re.compile(rf'@long-text#?\d*:(?:"([^"]*)"|({NAME_CHARS}*))')
+LONG_TEXT_PREVIEW_MAX = 60
+
 # @skill: / @file: 是「用户当时点了哪个技能、哪个文件」的唯一记录。
 # 删掉它等于抹掉「这句话是 /code-review 触发的」——而这件事在新对话里
 # 没有任何文件能查回来,只能靠上下文包自己说。
@@ -292,6 +299,21 @@ def render_markers(text: str) -> str:
     return text
 
 
+def render_long_text(text: str) -> str:
+    """把没有引文块的 @long-text 换成看得见的占位,而不是删掉。
+
+    用户在正文里讨论这个标记本身时(``比如 `@long-text:"预览"` 会被删``),
+    原来的删法会留下一对空反引号:原话消失,而且看不出少了什么。
+    """
+    def repl(m) -> str:
+        preview = (m.group(1) if m.group(1) is not None else (m.group(2) or "")).strip()
+        if len(preview) > LONG_TEXT_PREVIEW_MAX:
+            preview = preview[:LONG_TEXT_PREVIEW_MAX] + "…"
+        return f"[长引用 「{preview}」]" if preview else "[长引用]"
+
+    return LONG_TEXT_MARK_RE.sub(repl, text)
+
+
 def drop_tag_blocks(text: str, tags) -> str:
     """整块删掉一批已知标签连同内容。"""
     for tag in tags:
@@ -353,12 +375,16 @@ def clean_body(body: str):
     ——所以只摘附件、不碰排版。缩进和空行原样留着,代码块和栈才不会压平。
 
     允许"删"的只有 image_local_path 和带 data-role 的 system-reminder,
-    它们是平台拼进来的。@skill / @file 不删,换成看得见的占位。
+    它们是平台拼进来的。@skill / @file / @long-text 不删,换成看得见的占位。
     """
     paths = [p.strip() for p in IMAGE_PATH_RE.findall(body)]
     names = AT_IMAGE_RE.findall(body)
+    # 体内跟没跟引文块,决定 @long-text 的预览串是「重复」还是「唯一线索」
+    has_quote = "<long_text_quote" in body
 
     body = render_markers(body)
+    if not has_quote:
+        body = render_long_text(body)
     body = AT_MARK_RE.sub("", body)
     body = IMAGE_PATH_RE.sub("", body)
     body = re.sub(r'<system-reminder\s+data-role="[^"]*"[\s\S]*?</system-reminder>', "", body)
