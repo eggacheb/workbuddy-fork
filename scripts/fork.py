@@ -17,16 +17,22 @@ import time
 from collections import Counter
 from pathlib import Path
 
+# 只在真终端里改编码。被管道接走时上游多半按系统码页解码,
+# 强设 utf-8 会让中文在 PowerShell 里整段乱码。
 try:
-    sys.stdout.reconfigure(encoding="utf-8")
+    if sys.stdout.isatty():
+        sys.stdout.reconfigure(encoding="utf-8")
 except Exception:
     pass
 
 WB_HOME = Path(os.environ.get("WORKBUDDY_HOME") or (Path.home() / ".workbuddy"))
 PROJECTS_DIR = WB_HOME / "projects"
+TEMP_ROOT = Path(tempfile.gettempdir()).resolve() / "workbuddy-fork"
 
 REMINDER_RE = re.compile(r"<system-reminder[\s\S]*?</system-reminder>")
 QUERY_RE = re.compile(r"<user_query>([\s\S]*?)</user_query>")
+IMAGE_PATH_RE = re.compile(r"<image_local_path>([^<]+)</image_local_path>")
+AT_IMAGE_RE = re.compile(r"@image#?\d*:([^\s,，]+)")
 
 # 平台/队友/后台任务塞进用户消息的块,不是用户说的话
 INJECTED_BLOCKS = [
@@ -34,15 +40,28 @@ INJECTED_BLOCKS = [
     "teammate-message",
     "conversation_history_summary",
     "cb_summary",
+    "long_text_quote",
     "previous_user_message",
     "previous_assistant_message",
     "previous_tool_call",
     "user-prompt-submit-hook",
     "additional-data",
     "message-queue",
+    "image_local_path",
 ]
 INJECTED_RES = [re.compile(rf"<{tag}\b[\s\S]*?</{tag}>") for tag in INJECTED_BLOCKS]
-STARTS_WITH_TAG_RE = re.compile(r"^<[a-zA-Z][\w-]*[\s>/]")
+
+# 「整段只剩协议碎片」的判断只认这些标签名。
+# 用户自己贴 <div> / <config> 之类的代码时不能碰。
+KNOWN_TAGS = set(INJECTED_BLOCKS) | {
+    "system-reminder", "user_query", "image_local_path", "omitted",
+    "result", "summary", "status", "uuid", "tool-use-id", "task-id",
+}
+
+# @ 前缀的附件标记,只留文件名。
+# long-text / skill 后面常跟一段带引号的预览,整段要一起剥掉,
+# 否则预览里的空格会让它断在中间,残下半句进到正文里。
+AT_MARK_RE = re.compile(r'@(?:long-text|file|skill|image)#?\d*:(?:"[^"]*"|"[^"]*$|\S*)\s*')
 
 # 标签外面还挂着的 harness 指令,整段都不是用户说的
 NOISE_RES = [
@@ -76,22 +95,39 @@ ERR_STRONG_RE = re.compile(
     r"|invalid output|is not a function|is not callable|module not found|timed out)"
 )
 
-# 压缩版的截断长度
+# 压缩版的截断长度。说「助手截 200 字」指的是单条消息,
+# 一轮里可能有几十条,所以还要一个轮级上限兜住。
 COMPACT_USER = 400
 COMPACT_SAY = 200
+COMPACT_TURN = 500
 
 
 # ---------- 定位 ----------
 
 def find_log(session_id: str):
-    """按会话 ID 找 jsonl。不猜项目 slug,直接 glob。"""
-    hits = list(PROJECTS_DIR.glob(f"*/{session_id}.jsonl"))
-    if not hits:
-        hits = list(PROJECTS_DIR.rglob(f"{session_id}*.jsonl"))
-    hits = [p for p in hits if p.is_file()]
-    if not hits:
-        return None
-    return max(hits, key=lambda p: p.stat().st_size)
+    """按会话 ID 找 jsonl,返回 (状态, 命中列表)。
+
+    状态: ok / ambiguous / none。
+    前缀匹配只在 ID 够长时才做——`-s 0` 这种会静默命中完全不相干的会话。
+    """
+    exact = [p for p in PROJECTS_DIR.glob(f"*/{session_id}.jsonl") if p.is_file()]
+    if exact:
+        return ("ok", [max(exact, key=lambda p: p.stat().st_size)]) if len(exact) == 1 else ("ambiguous", exact)
+
+    if len(session_id) < 8:
+        return ("none", [])
+
+    partial = [p for p in PROJECTS_DIR.rglob(f"{session_id}*.jsonl") if p.is_file()]
+    if len(partial) == 1:
+        return ("ok", partial)
+    if len(partial) > 1:
+        return ("ambiguous", partial)
+    return ("none", [])
+
+
+def newest_log():
+    logs = all_logs()
+    return logs[0] if logs else None
 
 
 def all_logs():
@@ -133,15 +169,43 @@ def read_title(records) -> str:
     return ""
 
 
+def read_title_file(path: Path, max_lines: int = 400) -> str:
+    """只读文件头找标题,别为了一个字符串把整个日志解析进内存。"""
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            for i, line in enumerate(f):
+                if i >= max_lines:
+                    break
+                if '"ai-title"' not in line:
+                    continue
+                try:
+                    r = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if r.get("type") != "ai-title":
+                    continue
+                for key in ("title", "text", "content", "aiTitle"):
+                    v = r.get(key)
+                    if isinstance(v, str) and v.strip():
+                        return v.strip()
+    except OSError:
+        pass
+    return ""
+
+
 def read_cwd(records) -> str:
-    """取被导出会话自己的工作目录——不是当前会话的。"""
+    """取被导出会话自己的工作目录——不是当前会话的。
+
+    日志里没有 cwd 时宁可留空:填一个当前会话的目录比留空更糟,
+    新对话会照着错目录干活。
+    """
     seen = Counter(
         r.get("cwd") for r in records
         if isinstance(r.get("cwd"), str) and r.get("cwd").strip()
     )
     if seen:
         return seen.most_common(1)[0][0]
-    return os.environ.get("CODEBUDDY_PROJECT_DIR") or ""
+    return ""
 
 
 def short_path(text: str, limit: int) -> str:
@@ -179,25 +243,64 @@ def msg_text(record) -> str:
     return "\n".join(part_text(p) for p in content if part_text(p))
 
 
+def protocol_only(text: str) -> bool:
+    """整段只剩已知协议标签包着的碎片?只认白名单里的标签名。"""
+    tags = set(re.findall(r"</?([a-zA-Z][\w-]*)", text))
+    if not tags or not tags <= KNOWN_TAGS:
+        return False
+    return len(re.sub(r"<[^>]+>", "", text).strip()) < 30
+
+
+def short_img(path: str) -> str:
+    """图片路径太长会把 outline 挤满,只留最后两段。"""
+    path = path.strip()
+    if len(path) <= 48:
+        return path
+    parts = [p for p in re.split(r"[\\/]", path) if p]
+    return "/".join(parts[-2:]) if len(parts) >= 2 else path
+
+
 def clean_user(text: str) -> str:
-    """剥掉平台注入的上下文,只留用户真的说过的话。"""
+    """剥掉平台注入的上下文,只留用户真的说过的话。
+
+    顺序有讲究:先摘附件标记(它们会被当注入剥掉,但文件名是真信息),
+    再剥注入块,最后给 <user_query> 就地脱壳而不是把它抽到前面——
+    抽出来重排会打乱语序,「帮我看下 <q>这个配置</q>」会变成「这个配置 帮我看下」。
+    """
     text = REMINDER_RE.sub("", text)
-    queries = [q.strip() for q in QUERY_RE.findall(text) if q.strip()]
-    if queries:
-        return "\n\n".join(queries)
+
+    extras = []
+    # @image#N:名字 是用户看到的文件名,<image_local_path> 是系统存的随机名,
+    # 两条指的常常是同一张图。有前者就只留前者。
+    named = [n for n in AT_IMAGE_RE.findall(text) if n and not n.startswith("http")]
+    if named:
+        for name in named:
+            extras.append(f"[图片 {short_img(name)}]")
+    else:
+        for p in IMAGE_PATH_RE.findall(text):
+            extras.append(f"[图片 {short_img(p)}]")
+
     for pattern in INJECTED_RES:
         text = pattern.sub("", text)
-    text = text.strip()
+    text = AT_MARK_RE.sub("", text).strip()
     for pattern in NOISE_RES:
         text = pattern.sub("", text)
+    text = QUERY_RE.sub(lambda m: "\n" + m.group(1).strip() + "\n", text)
+    text = re.sub(r"[ \t]{2,}", " ", text)
+    if extras:
+        text = re.sub(r"^\[图片\]\s*$", "", text, flags=re.M)
     text = re.sub(r"\n{3,}", "\n\n", text).strip()
-    # 剥完还整段是协议标签的,不是人话
-    if STARTS_WITH_TAG_RE.match(text):
-        return ""
-    return text
+    # 剥掉 @ 标记后,正文前面常留一个孤零零的逗号
+    text = re.sub(r"^[，,、;；:：]+", "", text).strip()
+
+    if text and protocol_only(text):
+        text = ""
+
+    parts = extras + ([text] if text else [])
+    return "\n\n".join(p for p in parts if p)
 
 
-def parse_args(record) -> dict:
+def parse_args_of(record) -> dict:
     args = record.get("arguments")
     if isinstance(args, str):
         try:
@@ -210,7 +313,7 @@ def parse_args(record) -> dict:
 def brief_call(record, args=None) -> str:
     name = record.get("name") or "?"
     if args is None:
-        args = parse_args(record)
+        args = parse_args_of(record)
     for key in ARG_PRIORITY:
         val = args.get(key)
         if isinstance(val, str) and val.strip():
@@ -253,7 +356,8 @@ def scan_errors(text: str):
 def build_turns(records):
     """按时间排序,把每条用户发言当成一个 turn 的起点。
 
-    顺手把工具调用的原始参数和报错行挂在 turn 上——只留事实,不留全文。
+    助手先开口(日志被截断或接续)时丢掉那一段:给它编号会让
+    outline 的序号和真人对不上,--from 从此指错地方。
     """
     records = sorted(records, key=rec_ts)
     turns = []
@@ -269,17 +373,15 @@ def build_turns(records):
                 cur = {"user": said, "blocks": [], "calls": [], "errors": []}
                 turns.append(cur)
             elif role == "assistant":
-                said = msg_text(r).strip()
-                if not said:
-                    continue
                 if cur is None:
-                    cur = {"user": None, "blocks": [], "calls": [], "errors": []}
-                    turns.append(cur)
-                cur["blocks"].append(("say", said))
+                    continue
+                said = msg_text(r).strip()
+                if said:
+                    cur["blocks"].append(("say", said))
         elif rtype == "function_call":
             if cur is None:
                 continue
-            args = parse_args(r)
+            args = parse_args_of(r)
             cur["blocks"].append(("call", brief_call(r, args)))
             cur["calls"].append({"name": r.get("name") or "?", "args": args})
         elif rtype == "function_call_result":
@@ -308,7 +410,8 @@ def clip(text: str, limit: int) -> str:
     text = text.strip()
     if len(text) <= limit:
         return text
-    return " ".join(text[:limit].split()) + f" …(+{len(text) - limit} 字)"
+    kept = " ".join(text[:limit].split())
+    return kept + f" …(+{len(text) - len(kept)} 字)"
 
 
 def compact_blocks(blocks):
@@ -318,16 +421,15 @@ def compact_blocks(blocks):
     order = []
     for kind, val in blocks:
         if kind == "say":
-            says.append(clip(val, COMPACT_SAY))
+            says.append(val)
         else:
-            # blocks 里 call 是单条字符串,合并前的原始顺序
             name = val.split("(", 1)[0]
             names[name] += 1
             if name not in order:
                 order.append(name)
     out = []
     if says:
-        out.append("\n\n".join(says))
+        out.append(clip("\n\n".join(says), COMPACT_TURN))
     if order:
         out.append("工具:" + " · ".join(f"{n}×{names[n]}" for n in order))
     return out
@@ -343,10 +445,17 @@ def file_arg(args: dict) -> str:
     return ""
 
 
+def is_temp_artifact(path: str) -> bool:
+    """上一次跑脚本留下的临时文件,别让它冒充「改过的文件」。"""
+    s = path.replace("\\", "/")
+    if "/workbuddy-fork/" in s:
+        return True
+    return bool(re.search(r"-(?:package|from\d+)\.md$", s))
+
+
 def collect_facts(turns):
     edited = Counter()
     read = Counter()
-    first_seen = {}
     cmds = []
     seen_cmd = set()
     errors = []
@@ -357,15 +466,14 @@ def collect_facts(turns):
     for t in turns:
         for c in t["calls"]:
             name, a = c["name"], c["args"]
-            if name in EDIT_TOOLS:
+            if name in EDIT_TOOLS or name == "Read":
                 p = file_arg(a)
-                if p:
-                    edited[p] += 1
-                    first_seen.setdefault(p, len(first_seen))
-            elif name == "Read":
-                p = file_arg(a)
-                if p:
+                if not p or is_temp_artifact(p):
+                    continue
+                if name == "Read":
                     read[p] += 1
+                else:
+                    edited[p] += 1
             elif name in SHELL_TOOLS:
                 cmd = a.get("command")
                 if isinstance(cmd, str):
@@ -379,7 +487,7 @@ def collect_facts(turns):
                     seen_url.add(u)
                     urls.append(u)
         for e in t["errors"]:
-            key = e[:100]
+            key = e[:90]
             if key not in seen_err:
                 seen_err.add(key)
                 errors.append(e)
@@ -395,16 +503,18 @@ def collect_facts(turns):
 
 def spread(items, n):
     """在整段里均匀取几个,别总是尾巴上的那几条。"""
+    if n <= 0 or not items:
+        return []
     if len(items) <= n:
         return items
     if n == 1:
-        return [items[-1]]
+        return [items[len(items) // 2]]
     idx = sorted({round(i * (len(items) - 1) / (n - 1)) for i in range(n)})
     return [items[i] for i in idx]
 
 
-def pick_errors(lines, limit=4):
-    """去重后优先留真故障,其次才留轻的。"""
+def pick_errors(lines, limit=3):
+    """去重后优先留真故障;一条强故障都没有时退回普通报错,别交白卷。"""
     deduped, seen = [], set()
     for e in lines:
         key = e[:90]
@@ -413,15 +523,25 @@ def pick_errors(lines, limit=4):
         seen.add(key)
         deduped.append(e)
     strong = [e for e in deduped if ERR_STRONG_RE.search(e)]
-    return spread(strong, min(3, limit))
+    return spread(strong or deduped, limit)
 
 
-def render_facts(facts):
+def rel_path(path: str, base: str) -> str:
+    """落进工作目录的路径转相对,省掉每条重抄一遍前缀。"""
+    if not base:
+        return path
+    try:
+        return str(Path(path).relative_to(base))
+    except (ValueError, OSError):
+        return path
+
+
+def render_facts(facts, base=""):
     lines = []
     if facts["edited"]:
         lines.append("- 改过的文件(按改动次数):")
         for p, n in facts["edited"]:
-            lines.append(f"  - `{p}` ×{n}")
+            lines.append(f"  - `{rel_path(p, base)}` ×{n}")
     if facts["cmds"]:
         lines.append("- 跑过的命令(有代表性):")
         for c in facts["cmds"]:
@@ -437,7 +557,7 @@ def render_facts(facts):
     if facts["read"]:
         lines.append("- 读得最多的文件:")
         for p, n in facts["read"]:
-            lines.append(f"  - `{p}` ×{n}")
+            lines.append(f"  - `{rel_path(p, base)}` ×{n}")
     return lines
 
 
@@ -482,26 +602,28 @@ def fmt_time(value):
 
 def package_skeleton(meta, facts):
     """给模型填空的上下文包骨架。机械部分先写好,人话部分留空。"""
-    lines = [f"接着做 {meta['title'] or '<一句话说明这条线要干什么>'}。", ""]
+    title = meta["title"] or "<一句话说明这条线要干什么>"
+    span_label = "全程" if meta["start"] > 1 else ""
+    lines = [f"接着做 {title}。", ""]
     lines += [
         "## 之前那条线到哪了",
         "<!-- 2~3 句:目标是什么、做到哪一步。别复述过程 -->",
         "",
-        "## 已经定下的(别再问、别推翻)",
-        "- <!-- 拍板过的决定,一条一行 -->",
+        "## 已经定下的",
+        "- <!-- 拍板过的决定 — 因为什么。一条一行 -->",
         "",
-        "## 已经排除的(别重走)",
-        "- <!-- 方案 — 因为理由 -->",
+        "## 试过但不通的",
+        "- <!-- 试过的方案 — 断在哪、为什么 -->",
         "",
         "## 关键事实",
         "<!-- 以下由脚本从日志机械提取,可直接删改 -->",
-        f"- 来源会话 `{meta['session_id']}`,第 {meta['start']} ~ {meta['total']} 轮(共 {meta['total']} 轮)",
+        f"- 来源会话 `{meta['session_id']}`,第 {meta['start']} ~ {meta['end']} 轮(共 {meta['total']} 轮)",
     ]
     if meta.get("project_dir"):
         lines.append(f"- 工作目录 `{meta['project_dir']}`")
     if meta.get("span"):
-        lines.append(f"- 时间 {meta['span']}")
-    lines += render_facts(facts)
+        lines.append(f"- 时间 {meta['span']}{span_label}")
+    lines += render_facts(facts, meta.get("project_dir", ""))
     lines += [
         "",
         "## 这次要做",
@@ -519,15 +641,28 @@ def check_package(path: str) -> int:
     本该独立成条的决策。长度是症状,病根在某一节。
     """
     p = Path(path)
+    if p.is_dir():
+        print(f"--check 要文件路径,这是目录:{path}", file=sys.stderr)
+        return 2
     if not p.is_file():
         print(f"找不到文件:{path}", file=sys.stderr)
         return 2
-    text = p.read_text(encoding="utf-8")
+    try:
+        text = p.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        text = p.read_text(encoding="utf-8", errors="replace")
+        print("(文件不是 UTF-8,按替换字符读的,字数可能有偏差)\n")
     print(f"{p}\n共 {len(text)} 字符\n")
 
+    # 代码块里的 ## 是 shell / python 注释,不是节标题
     sections, name, buf = [], "(开头)", []
+    in_fence = False
     for line in text.splitlines():
-        if line.startswith("## "):
+        if line.lstrip().startswith("```"):
+            in_fence = not in_fence
+            buf.append(line)
+            continue
+        if not in_fence and line.startswith("## "):
             sections.append((name, buf))
             name, buf = line[3:].strip(), []
         else:
@@ -545,23 +680,33 @@ def check_package(path: str) -> int:
 
     if "<!--" in text:
         print("\n还有没删干净的 `<!--` 注释")
-
-    print("\n看哪一节在膨胀,不看总数:")
-    print("  关键事实占大头   → 里面多半是仓库查得到的东西,换成路径")
-    print("  某一节在讲过程   → 只留结论和原因,过程砍掉")
-    print("  节数比常规多     → 可能跨了好几条线,按 outline 拆包")
     return 0
 
 
+def positive_int(value):
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        raise argparse.ArgumentTypeError(f"要整数,收到 {value!r}")
+    if n < 1:
+        raise argparse.ArgumentTypeError("必须 ≥ 1")
+    return n
+
+
 def main():
-    ap = argparse.ArgumentParser(description="导出 WorkBuddy 会话主线,用于开新分支")
-    ap.add_argument("--session", "-s", help="会话 ID,默认取当前会话")
-    ap.add_argument("--list", "-l", action="store_true", help="列出本项目最近的会话")
+    ap = argparse.ArgumentParser(
+        description="导出 WorkBuddy 会话主线,用于开新分支",
+        epilog="读全量的判据不是轮数,是「包的四个待填节能不能写出内容」。",
+    )
+    ap.add_argument("--session", "-s", help="会话 ID,默认取当前会话(CODEBUDDY_SESSION_ID)")
+    ap.add_argument("--list", "-l", action="store_true", help="列出所有项目最近的会话")
     ap.add_argument("--outline", "-o", action="store_true", help="只列用户发言,挑分叉点用")
-    ap.add_argument("--from", dest="start", type=int, default=1, help="从第几个用户发言开始(含)")
-    ap.add_argument("--last", type=int, help="只要最近 N 个用户发言")
+    ap.add_argument("--from", dest="start", type=positive_int, default=1,
+                    help="从第几个用户发言开始(含这一句)")
+    ap.add_argument("--last", type=positive_int, help="只要最近 N 个用户发言(与 --from 二选一)")
     ap.add_argument("--compact", action="store_true", help="压缩版:助手发言截断、工具调用只留次数")
-    ap.add_argument("--package", action="store_true", help="同时生成上下文包骨架(<会话>-package.md)")
+    ap.add_argument("--package", action="store_true", help="同时生成上下文包骨架")
+    ap.add_argument("--force", action="store_true", help="允许覆盖已存在的上下文包")
     ap.add_argument("--check", metavar="FILE", help="按节报篇幅占比,指出哪节在膨胀")
     ap.add_argument("--out", help="输出文件路径,默认写系统临时目录")
     ap.add_argument("--stdout", action="store_true", help="直接打印全文到标准输出")
@@ -573,29 +718,37 @@ def main():
     if args.list:
         rows = all_logs()
         if not rows:
-            print("没有找到任何会话记录。")
+            print("没有找到任何会话记录。检查 WORKBUDDY_HOME 或 --session。")
             return 1
-        print(f"最近的会话({len(rows)} 个中有记录的前 20 个):\n")
+        print(f"最近的会话(共 {len(rows)} 个,显示前 20):\n")
         for p in rows[:20]:
-            recs = load_records(p)
-            title = read_title(recs) or "(无标题)"
+            title = read_title_file(p) or "(无标题)"
             print(f"{p.stem}  {fmt_time(p.stat().st_mtime)}  {title}")
         return 0
 
     session_id = args.session or os.environ.get("CODEBUDDY_SESSION_ID")
     if not session_id:
-        print("拿不到会话 ID:请用 --session 指定,或在 WorkBuddy 会话里运行。", file=sys.stderr)
+        print("拿不到会话 ID:用 --session 指定,或在 WorkBuddy 会话里运行。", file=sys.stderr)
+        print("如果这是后台/子代理会话,日志可能还没落盘——用 --list 挑一个。", file=sys.stderr)
         return 2
 
-    path = find_log(session_id)
-    if not path:
-        print(f"找不到会话 {session_id} 的日志。用 --list 看看有哪些。", file=sys.stderr)
+    status, hits = find_log(session_id)
+    if status == "ambiguous":
+        print(f"「{session_id}」匹配到 {len(hits)} 个会话,不猜。用完整 ID:", file=sys.stderr)
+        for p in hits[:10]:
+            print(f"  {p.stem}  {read_title_file(p) or '(无标题)'}", file=sys.stderr)
+        return 2
+    if status == "none":
+        print(f"找不到会话 {session_id} 的日志。", file=sys.stderr)
+        print("后台/子代理会话可能不落盘;用 --list 看看有哪些。", file=sys.stderr)
         return 2
 
+    path = hits[0]
     records = load_records(path)
     turns = build_turns(records)
     if not turns:
         print("这个会话里没有可提取的对话。", file=sys.stderr)
+        print("如果日志不是 WorkBuddy 格式(比如装进了 Claude Code),提取会全部落空。", file=sys.stderr)
         return 2
 
     total = len(turns)
@@ -607,28 +760,20 @@ def main():
             if len(said) > 72:
                 said = said[:72] + "…"
             print(f"  [{i:>3}] {said}")
-        if total > 60:
-            est = sum(len(t["user"] or "") for t in turns)
-            est += sum(len(v) for t in turns for k, v in t["blocks"] if k == "say")
-            est += 70 * sum(1 for t in turns for k, _ in t["blocks"] if k == "call")
-            tail = max(1, total - 39)
-            print(f"\n轮数偏多({total} 轮),全量约 {est // 1000}k 字符,一次读不完。建议:")
-            print(f"  --compact            全量压缩版,保留每一轮(推荐先跑这个看全貌)")
-            print(f"  --last 40            只带最近 40 轮")
-            print(f"  --from {tail}            从第 {tail} 轮往后(配 --compact 找转折点)")
-            print("  分段带的时候,每段各生成一份包,新对话里只贴真正需要的那份。")
-        else:
-            print("\n用 --from N 从第 N 个发言开始提取。")
+        print("\n--from N 从第 N 句**含**这一句开始。")
         return 0
 
-    start = max(1, args.start)
+    start = args.start
     if args.last:
-        start = max(start, total - args.last + 1)
+        if args.start > 1:
+            print(f"(--from {args.start} 被 --last {args.last} 覆盖)", file=sys.stderr)
+        start = max(1, total - args.last + 1)
     body = render_turns(turns, start, compact=args.compact)
     if not body.strip():
         print(f"从第 {start} 个发言开始没有内容(总共只有 {total} 个)。", file=sys.stderr)
         return 2
 
+    end = total
     calls = sum(1 for r in records if r.get("type") == "function_call")
     times = [rec_ts(r) for r in records if rec_ts(r)]
     span = f"{fmt_time(min(times) if times else 0)} ~ {fmt_time(max(times) if times else 0)}"
@@ -641,35 +786,49 @@ def main():
         f"- 全量:用户发言 {total} 次,工具调用 {calls} 次",
     ]
     if args.compact:
-        header.append(f"- 模式:压缩版(助手发言截到 {COMPACT_SAY} 字、用户发言截到 {COMPACT_USER} 字)")
+        header.append(f"- 模式:压缩版(单条助手 {COMPACT_SAY} 字、单轮 {COMPACT_TURN} 字、用户 {COMPACT_USER} 字)")
     if start > 1:
-        header.append(f"- 本段:第 {start} ~ {total} 个用户发言(前面 {start - 1} 个未包含)")
+        header.append(f"- 本段:第 {start} ~ {end} 个用户发言(前面 {start - 1} 个未包含)")
     doc = "\n".join(header) + "\n\n---\n\n" + body
+
+    if args.stdout and args.package:
+        ap.error("--stdout 与 --package 互斥:包总是先落盘再打印")
 
     if args.stdout:
         sys.stdout.write(doc)
         return 0
 
-    out_path = Path(args.out) if args.out else Path(tempfile.gettempdir()) / "workbuddy-fork" / f"{session_id}-from{start}.md"
+    out_path = Path(args.out) if args.out else TEMP_ROOT / f"{session_id}-from{start}.md"
+    if out_path.is_dir():
+        print(f"--out 需要文件路径,这是目录:{out_path}", file=sys.stderr)
+        return 2
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(doc, encoding="utf-8")
 
     print(f"已导出:{out_path}")
     print(f"规模:{len(doc)} 字符 / {len(doc.splitlines())} 行")
-    print(f"跨度:第 {start} ~ {total} 个用户发言(共 {total} 个,工具调用 {calls} 次)")
+    print(f"跨度:第 {start} ~ {end} 个用户发言(共 {total} 个,工具调用 {calls} 次)")
     if len(doc) > 150_000:
         print("\n注意:这段太长(>150k 字符),整段读会吃掉大量上下文。")
-        print("建议加 --compact 压一版,或 --last 40 只取最近一段。")
+        if args.compact:
+            print(f"已经是最紧的模式了。改用 --from {start} --last 40 分两段,各出一份包。")
+        else:
+            print("加 --compact 压一版,或 --last 40 只取最近一段。")
 
     if args.package:
         suffix = "" if start == 1 else f"-from{start}"
         pkg_path = out_path.parent / f"{session_id}{suffix}-package.md"
+        if pkg_path.exists() and not args.force:
+            print(f"\n已有一份包,没覆盖:{pkg_path}")
+            print("要重写就加 --force,或换 --out 放到别处——先看看原来那份是不是已经填好了。")
+            return 0
         facts = collect_facts(turns[start - 1:])
         meta = {
             "session_id": session_id,
             "title": read_title(records),
             "project_dir": read_cwd(records),
             "start": start,
+            "end": end,
             "total": total,
             "span": span,
         }
