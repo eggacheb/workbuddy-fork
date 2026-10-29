@@ -269,19 +269,25 @@ def clean_user(text: str) -> str:
     """
     text = REMINDER_RE.sub("", text)
 
-    extras = []
-    # @image#N:名字 是用户看到的文件名,<image_local_path> 是系统存的随机名,
-    # 两条指的常常是同一张图。有前者就只留前者。
-    named = [n for n in AT_IMAGE_RE.findall(text) if n and not n.startswith("http")]
-    if named:
-        for name in named:
-            extras.append(f"[图片 {short_img(name)}]")
-    else:
-        for p in IMAGE_PATH_RE.findall(text):
-            extras.append(f"[图片 {short_img(p)}]")
+    # 图片:名字是用户眼里的文件名,路径是唯一能定位文件的东西,两个都要。
+    # 只留名字的话,新对话拿一个磁盘上不存在的文件名,想看也看不了。
+    # 注意顺序:路径块要先抓(它本身在注入清单里,马上会被剥掉);
+    # 名字要等剥完注入再抓,否则压缩摘要里那些历史图片也会被捞出来。
+    paths = [p.strip() for p in IMAGE_PATH_RE.findall(text)]
 
     for pattern in INJECTED_RES:
         text = pattern.sub("", text)
+
+    names = [n for n in AT_IMAGE_RE.findall(text) if n and not n.startswith("http")]
+    extras = []
+    if paths:
+        for i, p in enumerate(paths):
+            label = names[i] if len(names) == len(paths) else ""
+            gone = "" if Path(p).is_file() else " (文件已不在磁盘)"
+            extras.append(f"[图片 {label}]({p}){gone}" if label else f"[图片 {p}]{gone}")
+    elif names:
+        extras.extend(f"[图片 {short_img(n)}]" for n in names)
+
     text = AT_MARK_RE.sub("", text).strip()
     for pattern in NOISE_RES:
         text = pattern.sub("", text)
