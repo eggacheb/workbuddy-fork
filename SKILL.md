@@ -33,7 +33,7 @@ python "$HOME/.workbuddy/skills/fork/scripts/fork.py" --outline
 
 - **默认从全部历史分叉**(分叉点 = 现在)。这是最常见的意思:背景全带走,新线换个方向。
 - 用户说「从第 N 句重来」时用 `--from N`——**含第 N 句本身**。走偏的是第 7 句、想从第 8 句开始,就写 `--from 8`。
-- `--from` 和 `--last` 可以组合:`--from 20 --last 40` 是「从第 20 句往后取 40 句」。只给 `--last` 才是取最后 N 句。
+- `--from` 和 `--last` 可以组合:`--from 20 --last 40` 是「从第 20 句往后取 40 句」,`--from 1 --last 40` 是「开头 40 句」。只给 `--last` 才是取最后 N 句。
 - 用户没说清、但语气像要重来时,把 outline 列给他挑,别猜。
 
 ### 2. 一条命令导出 + 出骨架
@@ -42,9 +42,11 @@ python "$HOME/.workbuddy/skills/fork/scripts/fork.py" --outline
 python "$HOME/.workbuddy/skills/fork/scripts/fork.py" --compact --package
 ```
 
-- `--compact`:单条助手发言截 200 字、单轮助手合计截 500 字、用户发言截 400 字,工具调用只留次数。29 MB 的会话压完约 74k 字符。
-- `--package`:同时生成 `<会话ID>-package.md` 骨架,并把骨架打到标准输出——省一次 Read。已有的包不会被覆盖,要重写得加 `--force`。
+- `--compact`:单条助手发言截 200 字、单轮助手合计截 500 字、用户发言截 400 字,工具调用只留次数。28 MB 的会话压完约 69k 字符,一次读得完。
+- `--package`:同时生成包骨架,并把骨架打到标准输出——省一次 Read。文件名是 `<会话ID>-package.md`,分段导出时是 `<会话ID>-from<N>-package.md`。**已有的包不会被覆盖**(正文更不会落到包上,`--out` 指向包会直接报错),要重写得加 `--force`。
 - 会话不是当前这个时加 `--session <id>`,`--list` 可以查。
+
+**会话 ID 对不上就是错误,不猜。** 后台/子代理会话的日志可能还没落盘,这时脚本会报错并列出最近的几个会话,而不是悄悄换成别的会话。确实要最近那个,加 `--newest`。
 
 **按轮数选导出方式:**
 
@@ -52,7 +54,7 @@ python "$HOME/.workbuddy/skills/fork/scripts/fork.py" --compact --package
 |---|---|
 | ≤ 40 | 全量(`--package`,不加 `--compact`),细节最全 |
 | 40 ~ 100 | `--compact --package` |
-| > 100 | 同上;压完若脚本报「>150k 字符」,按 `--from <转折点> --last 40` 分两段,每段各出一份包 |
+| > 100 | 同上;压完若脚本报「>150k 字符」,按 `--from <转折点> --last 20` 分两段,每段各出一份包 |
 
 轮数只是粗筛。**更准的信号是「线之间什么关系」**:
 
