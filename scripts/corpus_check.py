@@ -113,13 +113,17 @@ def collect_dsh(sessions_dir: Path) -> dict:
         "注入了多少": 0,
         "压缩检查点": 0,
         "未认识的 kind": 0,
+        "读不了": 0,
     }
     for p in dsh_logs_in(sessions_dir):
         stats["会话数"] += 1
         try:
             records = fork.load_records(p)
-        except (OSError, ValueError, fork.ZstdUnavailable) as e:
-            print(f"  跳过 {p}:{e}", file=sys.stderr)
+        except Exception as e:
+            # 读不了要计数并判失败:跳过去继续扫,最后报「0 个问题」,
+            # 就是把「没扫到」说成了「没问题」。
+            stats["读不了"] += 1
+            print(f"  读不了 {p}:{type(e).__name__}: {e}", file=sys.stderr)
             continue
 
         containers = fork.dsh_containers(records)
@@ -158,7 +162,9 @@ def collect_dsh(sessions_dir: Path) -> dict:
         for t in turns:
             if not re.sub(r"<[^>]+>", "", t["user"]).strip():
                 stats["幽灵发言"] += 1
-    stats["整条丢掉"] = max(0, stats["原始发言"] - stats["计入发言"])
+    # 这一项是从上面两个数推出来的,不是独立测量;留着只因它在表里能一眼看懂。
+    # 真正的判据是「原始 == 计入」(见 dsh_problems),两个方向错了都能抓到。
+    stats["整条丢掉"] = stats["原始发言"] - stats["计入发言"]
     return stats
 
 
@@ -176,6 +182,8 @@ def dsh_problems(stats: dict):
     if stats["原始工具"] != stats["工具调用"]:
         out.append(f"日志里有 {stats['原始工具']} 条工具记录,导出只拿到 {stats['工具调用']} 次:"
                    "有一种工具约定没被认出来(只认了 ptc-dispatch?)。")
+    if stats.get("读不了"):
+        out.append(f"有 {stats['读不了']} 个会话读不了,已跳过:这批没扫到,不等于没内容。")
     return out
 
 

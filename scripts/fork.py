@@ -325,17 +325,45 @@ def peek_first_record(path: Path):
 
 
 def sniff_source(path: Path) -> str:
-    """按日志内容判来源,判据是首行类型。认不出来返回空串,不猜。"""
+    """按日志内容判来源,判据是首行类型。
+
+    首行是 dsh 的 `{"type":"session","version":4}` → dsh;**其余一律按
+    workbuddy 处理**——WorkBuddy 的日志本来就没有头记录,「不是 dsh」在这里
+    只有一个已知答案,不算猜。真正的保护在下一层:按 workbuddy 解析出 0 条
+    发言时,`open_workbuddy_session` 会看一眼是不是 dsh 的记录并提示,而且
+    那种情况是 rc=2,不会伪装成一次成功的导出。
+
+    只有读不了(路径不存在、zstd 坏掉)才返回空串,那种情况已经报过错。
+    """
     try:
         first = peek_first_record(path)
-    except (OSError, ValueError, ZstdUnavailable) as e:
-        print(f"读不了这份日志:{path}\n  {e}", file=sys.stderr)
+    except Exception as e:
+        # 边界:坏 zip / 坏 zstd / 权限,都在这里变成一句人话
+        print(f"读不了这份日志:{path}\n  {type(e).__name__}: {e}", file=sys.stderr)
         return ""
     if not first:
+        print(f"这份日志里没有任何一条能解析的记录:{path}", file=sys.stderr)
         return ""
     if first.get("type") == "session" and first.get("version") == 4:
         return "dsh"
     return "workbuddy"
+
+
+def looks_like_dsh(path: Path, max_lines: int = 200) -> bool:
+    """按 workbuddy 解析出 0 条发言时,判断这是不是一份 dsh 日志。
+
+    只给报错信息用:认得出来就说「加 --source dsh」,而不是让用户对着
+    「没有可提取的对话」自己猜。
+    """
+    try:
+        for i, line in enumerate(iter_lines(path)):
+            if i >= max_lines:
+                break
+            if '"user/message"' in line:
+                return True
+    except Exception:
+        return False
+    return False
 
 
 def rec_ts(r):
@@ -1632,8 +1660,12 @@ def open_workbuddy_session(path: Path):
     turns = build_turns(records)
     if not turns:
         print("这个会话里没有可提取的对话。", file=sys.stderr)
-        print("如果日志不是 WorkBuddy 格式(比如 dsh 导出的),用 --source dsh 或 --path 指过去。",
-              file=sys.stderr)
+        if looks_like_dsh(path):
+            print("这份日志里有 dsh 的 user/message 记录,但首行不是 dsh 的会话头;"
+                  "加 --source dsh 显式指定。", file=sys.stderr)
+        else:
+            print("如果日志不是 WorkBuddy 格式(比如 dsh 导出的),用 --source dsh 或 --path 指过去。",
+                  file=sys.stderr)
         return None, 2
 
     sid, guessed = session_identity(path, records)
@@ -1655,8 +1687,10 @@ def open_dsh_session(path: Path):
     except ZstdUnavailable as e:
         print(str(e), file=sys.stderr)
         return None, 2
-    except (OSError, ValueError) as e:
-        print(f"读不了这份日志:{path}\n  {e}", file=sys.stderr)
+    except Exception as e:
+        # 边界:坏 zip、坏 zstd、权限。宁可在这里崩一句人话,也不要让半份
+        # 日志被当成「这个会话没有内容」。
+        print(f"读不了这份日志:{path}\n  {type(e).__name__}: {e}", file=sys.stderr)
         return None, 2
 
     turns, stats = build_turns_dsh(records)

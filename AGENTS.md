@@ -33,7 +33,7 @@ python scripts/corpus_check.py --equiv HEAD~1   # 和旧版逐字节比输出,�
 
 WorkBuddy 的会话日志在 `~/.workbuddy/projects/<项目slug>/<会话Id>.jsonl`,目录可用 `WORKBUDDY_HOME` 覆盖;dsh 的在 `~/.dsh/sessions/<项目slug>/<会话Id>/session.v4.jsonl.zstd`,用 `DSH_HOME` 覆盖。测试全部靠这两个变量指到临时 fixture,**绝不读真实会话**——否则结果取决于这台机器上聊过什么。
 
-dsh 的 `corpus_check` 判的是不变量而不是方向:**计入发言 == 原始发言、整条丢掉 == 0、幽灵发言 == 0、未认识的 `source.kind` == 0**,任何一条破了就非零退出。`--equiv` 只支持 WorkBuddy——老版本 fork.py 根本不认 dsh,没有可比对象。
+dsh 的 `corpus_check` 判的是不变量而不是方向:**计入发言 == 原始发言、幽灵发言 == 0、工具调用 == 原始工具记录、未认识的 `source.kind` == 0、读不了的会话 == 0**(前两条恒等推得出「整条丢掉 == 0」,单独打出来只为看得见)。任何一条破了就非零退出,不带 `--compare` 也查。`--equiv` 只支持 WorkBuddy——老版本 fork.py 根本不认 dsh,没有可比对象。
 
 `pre-commit` 在提交前跑全量测试,不过就拦下(`scripts/sync-skill.sh --install-hooks` 装的)。CI 跑同一份,runner 用 `windows-latest`:中文管道编码那条用例只有在 Windows 上才有意义。
 

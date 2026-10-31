@@ -81,14 +81,16 @@ sync_into() {
 sync_once() {
     sync_into "$dest"
 
-    # 只在 dsh 的 skills 目录已经存在时同步:没装 dsh 的机器上跑一次同步,
-    # 不该凭空多出一个 ~/.dsh。
-    local dsh_root
-    dsh_root="$(dirname "$dsh_dest")"
-    if [ -d "$dsh_root" ] || [ -n "${DSH_SKILLS_DIR:-}" ]; then
+    # 判据是「装了 dsh」= ~/.dsh 存在,不是「~/.dsh/skills 存在」——
+    # 后者首次安装时往往还没有,那样第一次同步会被跳过,技能永远装不上。
+    # 反过来说,没装 dsh 的机器上跑一次同步也不该凭空多出一个 ~/.dsh。
+    local dsh_skills dsh_home
+    dsh_skills="$(dirname "$dsh_dest")"
+    dsh_home="$(dirname "$dsh_skills")"
+    if [ -d "$dsh_home" ] || [ -n "${DSH_SKILLS_DIR:-}" ]; then
         sync_into "$dsh_dest"
     else
-        echo "跳过 dsh:$dsh_root 不存在(没装 dsh 就不用管)" >&2
+        echo "跳过 dsh:$dsh_home 不存在(没装 dsh 就不用管)" >&2
     fi
 }
 

@@ -115,7 +115,7 @@ dsh 的会话格式和 WorkBuddy 完全不同，所以走的是另一条适配�
 | 压缩 | 明文 | zstd（导出包是明文 zip） |
 | 用户消息 | `{type:"message", role:"user", content:[…]}` | `{type:"user/message", data:{content:[…], source:{kind}}}` |
 | 区分「谁在说话」 | 靠 `<user_query>` 切体内外，再按标签剥 | 靠 `data.source.kind`：只有 `user` 是人话 |
-| 工具调用 | `type:"function_call"` | `type:"tool/ptc-dispatch"`（`tool/call` 里只有 `run_code` 容器） |
+| 工具调用 | `type:"function_call"` | `type:"tool/ptc-dispatch"`（PTC 模式）；直接模式下是 `type:"tool/call"` 里的真工具 |
 
 Claude Code、Cursor 等其它框架仍然不支持：装到 `~/.claude/skills/` 里能加载，但读不到会话。要加一种来源，照着 `build_turns_dsh` 再写一个适配器——它产出与 `build_turns` 同一套 turn schema，渲染、`--from`、包骨架都不用动。
 
@@ -197,7 +197,7 @@ dsh 的日志里，注入和原话是同一个结构（都是 `user/message`）�
 | `agent-message` / `subagent-settled` | 子代理的往来，不是用户说的 |
 | `compact-checkpoint` | 压缩摘要 |
 
-只认 `kind == "user"`，其余一律不进正文，**但会被数出来**：header 的 `- 忽略:注入 N 条` 就是它们。实测本机 118 个 dsh 会话：353 条真发言全部计入，挡掉 1007 条注入，0 条误判。
+只认 `kind == "user"`，其余一律不进正文，**但会被数出来**：header 的 `- 忽略:非用户消息 N 条` 就是它们；有压缩检查点时那一行后面补 `,其中压缩检查点 K 处(原文完整保留)`。实测本机 118 个 dsh 会话：353 条真发言全部计入，挡掉 1007 条注入，0 条误判。
 
 两条容易误会的地方：
 

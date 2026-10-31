@@ -263,23 +263,37 @@ def zstd_backend() -> str:
         return ""
 
 
-def write_dsh_zip_zstd(path, records, name="session.v4.jsonl.zstd"):
-    """包里装的成员自己也是 zstd —— 有人会把活日志原样塞进 zip。"""
-    import zipfile
-    body = ("\n".join(json.dumps(r, ensure_ascii=False) for r in records) + "\n").encode("utf-8")
+def compress_zstd(body: bytes) -> bytes:
     backend = zstd_backend()
     if backend == "stdlib":
         from compression import zstd
-        blob = zstd.compress(body)
-    elif backend == "zstandard":
+        return zstd.compress(body)
+    if backend == "zstandard":
         import zstandard
-        blob = zstandard.ZstdCompressor().compress(body)
-    else:
-        raise RuntimeError("本机没有 zstd 实现")
+        return zstandard.ZstdCompressor().compress(body)
+    raise RuntimeError("本机没有 zstd 实现")
+
+
+def dsh_body(records) -> bytes:
+    return ("\n".join(json.dumps(r, ensure_ascii=False) for r in records) + "\n").encode("utf-8")
+
+
+def write_dsh_zip_zstd(path, records, name="session.v4.jsonl.zstd"):
+    """包里装的成员自己也是 zstd —— 有人会把活日志原样塞进 zip。"""
+    import zipfile
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(path, "w") as z:
-        z.writestr(name, blob)
+        z.writestr(name, compress_zstd(dsh_body(records)))
+    return path
+
+
+def write_dsh_zstd(directory, records, name="session.v4.jsonl.zstd"):
+    """本机活日志的样子:~/.dsh/sessions/<项目>/<会话>/session.v4.jsonl.zstd。"""
+    d = Path(directory)
+    d.mkdir(parents=True, exist_ok=True)
+    path = d / name
+    path.write_bytes(compress_zstd(dsh_body(records)))
     return path
 
 

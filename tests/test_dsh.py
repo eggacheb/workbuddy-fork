@@ -264,6 +264,18 @@ class 语料(unittest.TestCase):
         self.assertEqual(r.returncode, 1, r.stdout)
         self.assertIn("不认识的", r.stdout)
 
+    def test_读不了的会话判失败(self):
+        # 「跳过」和「没问题」不是一回事:一个会话都没扫到时报 0 个问题,
+        # 等于把「没扫到」说成「没问题」。
+        broken = self.home / "sessions" / "proj" / "session-broken"
+        broken.mkdir(parents=True)
+        (broken / "session.v4.jsonl.zstd").write_bytes(b"garbage")
+
+        r = self.跑()
+
+        self.assertEqual(r.returncode, 1, r.stdout)
+        self.assertIn("读不了", r.stdout)
+
     def test_剥完只剩标签的发言会被抓出来(self):
         self.跑("--save", str(self.base))
         records = 标准会话() + [
@@ -318,6 +330,27 @@ class 输入(_DshHome):
 
         self.assertEqual(r.returncode, 0, err_text(r))
         self.assertIn("共 2 个用户发言", out_text(r))
+
+    @unittest.skipUnless(support.zstd_backend(), "本机没有 zstd 实现")
+    def test_本机活日志的zstd也能读(self):
+        # 这才是 dsh 里的自然用法:~/.dsh/sessions/<slug>/<id>/session.v4.jsonl.zstd
+        support.write_dsh_zstd(self.home / "sessions" / "proj" / self.sid, 标准会话())
+
+        r = run_cli("--outline", "--source", "dsh", "--newest", dsh_home=self.home)
+
+        self.assertEqual(r.returncode, 0, err_text(r))
+        self.assertIn("共 2 个用户发言", out_text(r))
+
+    def test_坏掉的zstd报错_不装成没内容(self):
+        d = self.home / "sessions" / "proj" / self.sid
+        d.mkdir(parents=True)
+        (d / "session.v4.jsonl.zstd").write_bytes(b"this is not zstd at all")
+
+        r = run_cli("--stdout", "--source", "dsh", "-s", self.sid, dsh_home=self.home)
+
+        self.assertNotEqual(r.returncode, 0)
+        self.assertTrue(err_text(r).strip(), "读不了也要说一句人话,不能静默")
+        self.assertEqual(out_text(r), "")
 
 
 if __name__ == "__main__":
