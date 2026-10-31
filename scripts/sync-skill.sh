@@ -9,11 +9,15 @@
 #   scripts/sync-skill.sh                  手动同步一次
 #   scripts/sync-skill.sh --install-hooks  装 post-commit / post-merge 钩子
 #
-# 目标目录可用 WORKBUDDY_SKILLS_DIR 覆盖。
+# 两个目标:
+#   ~/.workbuddy/skills/fork/  (WORKBUDDY_SKILLS_DIR 可覆盖)  —— 总是同步
+#   ~/.dsh/skills/fork/        (DSH_SKILLS_DIR 可覆盖)        —— 只在装了 dsh 时同步
+# 没装 dsh 的人不该因为跑一次同步就多出一个 ~/.dsh 目录。
 set -euo pipefail
 
 src="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 dest="${WORKBUDDY_SKILLS_DIR:-$HOME/.workbuddy/skills/fork}"
+dsh_dest="${DSH_SKILLS_DIR:-$HOME/.dsh/skills/fork}"
 hook_dir="$src/.git/hooks"
 
 install_hooks() {
@@ -50,27 +54,42 @@ HOOK
     echo "已装钩子:pre-commit"
 }
 
-sync_once() {
-    mkdir -p "$dest/scripts"
+sync_into() {
+    local target="$1"
+    mkdir -p "$target/scripts"
 
     local f
     for f in SKILL.md README.md LICENSE; do
-        [ -f "$src/$f" ] && cp -f "$src/$f" "$dest/$f"
+        [ -f "$src/$f" ] && cp -f "$src/$f" "$target/$f"
     done
 
     shopt -s nullglob
     local py
     for py in "$src"/scripts/*.py; do
-        cp -f "$py" "$dest/scripts/"
+        cp -f "$py" "$target/scripts/"
     done
 
     # 删掉源里已经没有的旧副本,否则改名/删文件后 skills 目录会留着幽灵脚本
-    for py in "$dest"/scripts/*.py; do
+    for py in "$target"/scripts/*.py; do
         [ -f "$src/scripts/$(basename "$py")" ] || rm -f "$py"
     done
     shopt -u nullglob
 
-    echo "已同步到:$dest"
+    echo "已同步到:$target"
+}
+
+sync_once() {
+    sync_into "$dest"
+
+    # 只在 dsh 的 skills 目录已经存在时同步:没装 dsh 的机器上跑一次同步,
+    # 不该凭空多出一个 ~/.dsh。
+    local dsh_root
+    dsh_root="$(dirname "$dsh_dest")"
+    if [ -d "$dsh_root" ] || [ -n "${DSH_SKILLS_DIR:-}" ]; then
+        sync_into "$dsh_dest"
+    else
+        echo "跳过 dsh:$dsh_root 不存在(没装 dsh 就不用管)" >&2
+    fi
 }
 
 case "${1:-}" in

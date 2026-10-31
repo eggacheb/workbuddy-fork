@@ -8,6 +8,7 @@
 """
 
 import argparse
+import io
 import json
 import os
 import re
@@ -31,6 +32,39 @@ for _stream in (sys.stdout, sys.stderr):
 WB_HOME = Path(os.environ.get("WORKBUDDY_HOME") or (Path.home() / ".workbuddy"))
 PROJECTS_DIR = WB_HOME / "projects"
 TEMP_ROOT = Path(tempfile.gettempdir()).resolve() / "workbuddy-fork"
+
+# dsh(DeepSeek Harness)的会话:~/./.dsh/sessions/<项目slug>/<会话id>/session.v4.jsonl.zstd
+# 导出包是同一个 session.v4.jsonl,外加 media/(文件名带冒号,Windows 上解不出来,
+# 所以只读 jsonl,不碰 media)。
+DSH_HOME = Path(os.environ.get("DSH_HOME") or (Path.home() / ".dsh"))
+DSH_SESSIONS = DSH_HOME / "sessions"
+DSH_LOG_NAME = "session.v4.jsonl"
+DSH_LOG_ZSTD = DSH_LOG_NAME + ".zstd"
+
+# dsh 把「这是不是人话」写在 source.kind 里:只有 user 是用户真说的,其余全是
+# 平台拼的。判据是来源,不是措辞——那些注入的正文里连标签都未必有(ADR-0007)。
+DSH_USER_KIND = "user"
+# 认识的非用户 kind。不认识的也丢,但要在 stderr 说出来:默认丢 + 不出声,
+# 正是这个脚本历史上每个 P0 的形状。
+DSH_KNOWN_KINDS = {
+    "ptc-mode",
+    "agent-instructions",
+    "runtime-context",
+    "skill-catalog",
+    "skill-invocation",
+    "compact-checkpoint",
+    "repeat-tool-reminder",
+    "plugin:ptc-plus",
+    "system-prompt",
+    # 子代理的往来。全库 137 条,内容是子代理自己写完的报告和「我干完了」——
+    # 是执行细节,不是用户说的话。主代理的发言里已经有结论,这里再抄一遍只是更长的重复。
+    "agent-message",
+    "subagent-settled",
+    # 环境通知:模型换了、时间采样、审批策略变了。全是平台在自言自语。
+    "model-selection",
+    "time-context",
+    "user-approval",
+}
 
 REMINDER_RE = re.compile(r"<system-reminder[\s\S]*?</system-reminder>")
 
@@ -119,8 +153,11 @@ NOISE_RES = [
 # 工具调用里最该留下的一行参数
 ARG_PRIORITY = ["file_path", "path", "command", "pattern", "url", "query", "prompt", "description"]
 
-EDIT_TOOLS = {"Edit", "Write", "MultiEdit", "NotebookEdit"}
-SHELL_TOOLS = {"Bash", "PowerShell", "run_command"}
+# dsh 的工具名是小写的 bash/read/write/edit,WorkBuddy 是 Bash/Read/Write。
+# 两套都收进来:这里判的是「这个工具动了文件还是跑了命令」,与来源无关。
+EDIT_TOOLS = {"Edit", "Write", "MultiEdit", "NotebookEdit", "edit", "write"}
+SHELL_TOOLS = {"Bash", "PowerShell", "run_command", "bash", "shell"}
+READ_TOOLS = {"Read", "read"}
 
 # 报错行:只认像日志的那几行,长行(多半是文件内容)跳过
 ERR_LINE_RE = re.compile(
@@ -192,20 +229,113 @@ def newest_log():
     return logs[0] if logs else None
 
 
+class ZstdUnavailable(RuntimeError):
+    """日志是 zstd,而这台机器上没有解压手段。宁可报错,也不出空包。"""
+
+
+def _zstd_stream(raw, label: str):
+    """把 zstd 二进制流解成明文流:先试 stdlib(3.14+),再试 zstandard 模块。
+
+    三级降级的判据是「能不能 import」,不是「解出来像不像 JSON」——
+    后者会把「依赖缺失」变成「这个会话没有内容」。
+    """
+    hint = (f"读不了 zstd 压缩的日志:{label}\n"
+            "  需要 Python 3.14+ 的 compression.zstd,或者 `pip install zstandard`。\n"
+            "  也可以把会话导出成 zip,用 --path 指过去。")
+    by_path = isinstance(raw, (str, os.PathLike))
+    try:
+        from compression import zstd  # Python 3.14+
+    except (ImportError, AttributeError):
+        try:
+            import zstandard
+        except ImportError:
+            raise ZstdUnavailable(hint)
+        stream = open(raw, "rb") if by_path else raw
+        return zstandard.ZstdDecompressor().stream_reader(stream, closefd=True)
+
+    # stdlib 的 ZstdFile 按路径开;已经拿到流(在 zip 里)时走模块级 decompress。
+    if by_path:
+        return zstd.open(str(raw), "rb")
+    try:
+        return io.BytesIO(zstd.decompress(raw.read()))
+    except AttributeError:
+        raise ZstdUnavailable(hint)
+
+
+def _open_text_stream(path: Path):
+    """打开「一行一条 JSON」的日志,透明处理 zip / zstd / 明文。"""
+    name = path.name.lower()
+    if name.endswith(".zip"):
+        import zipfile
+        z = zipfile.ZipFile(path)
+        members = [n for n in z.namelist()
+                   if n.rsplit("/", 1)[-1] in (DSH_LOG_NAME, DSH_LOG_ZSTD)]
+        if not members:
+            members = [n for n in z.namelist() if n.endswith(".jsonl")]
+        if not members:
+            z.close()
+            raise ValueError(f"压缩包里没有 {DSH_LOG_NAME}")
+        member = members[0]
+        raw = z.open(member)
+        # 包里的成员也可能自己还是 zstd(有人把活日志直接塞进 zip):
+        # 按明文读的话每一行都 JSON 解析失败,最后报「没有用户发言」——
+        # 正是「不许出空包」要拦的形态。
+        if member.lower().endswith(".zstd"):
+            raw = _zstd_stream(raw, f"{path}!{member}")
+        return io.TextIOWrapper(raw, encoding="utf-8", errors="replace")
+    if name.endswith(".zstd"):
+        return io.TextIOWrapper(_zstd_stream(path, str(path)), encoding="utf-8", errors="replace")
+    return open(path, encoding="utf-8", errors="replace")
+
+
+def iter_lines(path: Path):
+    with _open_text_stream(path) as f:
+        for line in f:
+            yield line
+
+
 def load_records(path: Path):
     out = []
-    with open(path, encoding="utf-8", errors="replace") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                obj = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if isinstance(obj, dict):
-                out.append(obj)
+    for line in iter_lines(path):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(obj, dict):
+            out.append(obj)
     return out
+
+
+def peek_first_record(path: Path):
+    """只看第一条能解析的记录,用来判来源,不把整本日志读进内存。"""
+    for line in iter_lines(path):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(obj, dict):
+            return obj
+    return None
+
+
+def sniff_source(path: Path) -> str:
+    """按日志内容判来源,判据是首行类型。认不出来返回空串,不猜。"""
+    try:
+        first = peek_first_record(path)
+    except (OSError, ValueError, ZstdUnavailable) as e:
+        print(f"读不了这份日志:{path}\n  {e}", file=sys.stderr)
+        return ""
+    if not first:
+        return ""
+    if first.get("type") == "session" and first.get("version") == 4:
+        return "dsh"
+    return "workbuddy"
 
 
 def rec_ts(r):
@@ -688,6 +818,170 @@ def build_turns(records):
     return turns
 
 
+# ---------- dsh 来源 ----------
+
+def dsh_data(record) -> dict:
+    d = record.get("data")
+    return d if isinstance(d, dict) else {}
+
+
+def dsh_message(record) -> dict:
+    """承载 content 的那一层:user/message 直接挂在 data 上,其余在 data.message 里。"""
+    d = dsh_data(record)
+    m = d.get("message")
+    return m if isinstance(m, dict) else d
+
+
+def dsh_parts(message) -> list:
+    content = message.get("content") if isinstance(message, dict) else None
+    return content if isinstance(content, list) else []
+
+
+def dsh_text(message) -> str:
+    """只取 type=text 的块。
+
+    reasoning 块的正文也在 `text` 字段里,不过滤就等着把模型的内部独白当成
+    它说过的话——实测一份会话里 reasoning 有 17.8 万字,是正文的 7 倍。
+    """
+    return "\n".join(
+        p.get("text") or "" for p in dsh_parts(message)
+        if isinstance(p, dict) and p.get("type") == "text")
+
+
+def dsh_kind(record) -> str:
+    src = dsh_message(record).get("source")
+    return (src.get("kind") or "") if isinstance(src, dict) else ""
+
+
+def dsh_ts(record):
+    v = record.get("time")
+    return v if isinstance(v, (int, float)) else 0
+
+
+def build_turns_dsh(records):
+    """dsh:只认 source.kind == "user" 的发言,其余按来源丢弃并计数。
+
+    返回 (turns, stats)。turn dict 与 build_turns 同一套 schema,所以渲染、
+    --from / --last、包骨架一行都不用改。
+
+    turn 不作为编号单位:一个 turn 里可以有多条发言(用户在助手干活时插话),
+    按 turn 编号会把第二条吞进第一条,--from 从此指错地方。
+    """
+    turns, cur = [], None
+    stats = {"ignored": 0, "compactions": 0, "calls": 0, "unknown": Counter()}
+
+    for r in records:
+        rtype = r.get("type")
+
+        if rtype == "user/message":
+            kind = dsh_kind(r)
+            if kind == DSH_USER_KIND:
+                said = dsh_text(dsh_message(r)).strip()
+                if not said:
+                    continue
+                cur = {"user": said, "blocks": [], "calls": [], "errors": [], "ts": dsh_ts(r)}
+                turns.append(cur)
+                continue
+            stats["ignored"] += 1
+            if kind == "compact-checkpoint":
+                stats["compactions"] += 1
+            elif kind and kind not in DSH_KNOWN_KINDS:
+                stats["unknown"][kind] += 1
+
+        elif rtype == "assistant/message":
+            if cur is None:
+                continue
+            for part in dsh_parts(dsh_message(r)):
+                if not isinstance(part, dict) or part.get("type") != "text":
+                    continue
+                said = (part.get("text") or "").strip()
+                if said:
+                    cur["blocks"].append(("say", said))
+
+        elif rtype == "tool/ptc-dispatch":
+            # 真正的工具在 PTC 派发这一层;tool/call 里只有 run_code 这个容器,
+            # 露在正文里等于每轮都写一句「跑了一段代码」,没有信息量。
+            if cur is None:
+                continue
+            d = dsh_data(r)
+            args = d.get("arguments")
+            if not isinstance(args, dict):
+                args = {}
+            call = {"name": d.get("name") or "?", "args": args}
+            cur["blocks"].append(("call", brief_call(call, args)))
+            cur["calls"].append(call)
+            stats["calls"] += 1
+            if d.get("isError"):
+                body = "\n".join(p.get("text") or "" for p in d.get("content") or []
+                                 if isinstance(p, dict))
+                cur["errors"].extend(scan_errors(body))
+
+        elif rtype == "tool/result":
+            if cur is None:
+                continue
+            cur["errors"].extend(scan_errors(dsh_text(dsh_message(r))))
+
+    return turns, stats
+
+
+def read_dsh_header(records) -> dict:
+    for r in records:
+        if r.get("type") == "session" and isinstance(r.get("version"), int):
+            return r
+    return {}
+
+
+def read_dsh_title(records) -> str:
+    """标题先写一个 fallback 再被 provider 覆盖,所以取最后一条,不是第一条。
+
+    标题常常是第一句话的截断,而第一句话可能是 `# 任务:…`。原样放进 header
+    会变成 `# 会话记录:# 任务:…`,把一整个文档的标题层级搞乱,所以剥掉开头的
+    Markdown 井号——那本来也不是标题的一部分。
+    """
+    title = ""
+    for r in records:
+        if r.get("type") == "session/title":
+            v = dsh_data(r).get("title")
+            if isinstance(v, str) and v.strip():
+                title = v.strip()
+    stripped = re.sub(r"^#+\s*", "", title).strip()
+    return stripped or title
+
+
+def read_dsh_title_file(path: Path, max_lines: int = 400) -> str:
+    """只读开头若干行找标题,别为了一个字符串把整本日志解压进内存。"""
+    title = ""
+    try:
+        for i, line in enumerate(iter_lines(path)):
+            if i >= max_lines:
+                break
+            if '"session/title"' not in line:
+                continue
+            try:
+                r = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            v = dsh_data(r).get("title")
+            if isinstance(v, str) and v.strip():
+                title = v.strip()
+    except (OSError, ValueError, ZstdUnavailable):
+        return ""
+    return title
+
+
+def dsh_stem(path: Path, session_id: str) -> str:
+    """给导出文件起名用的 stem。
+
+    dsh 的日志文件名恒为 session.v4.jsonl,直接拿它当 stem 会让所有会话撞到
+    同一份包上;会话 ID 是唯一且稳定的,用它。
+    """
+    if session_id:
+        return session_id
+    if path.name in (DSH_LOG_NAME, DSH_LOG_ZSTD):
+        return path.parent.name
+    return path.stem
+
+
 def merge_blocks(blocks):
     """相邻的助手发言合成一段,相邻的工具调用并成一列。"""
     merged = []
@@ -770,11 +1064,11 @@ def collect_facts(turns):
     for t in turns:
         for c in t["calls"]:
             name, a = c["name"], c["args"]
-            if name in EDIT_TOOLS or name == "Read":
+            if name in EDIT_TOOLS or name in READ_TOOLS:
                 p = file_arg(a)
                 if not p or is_temp_artifact(p):
                     continue
-                (read if name == "Read" else edited)[p] += 1
+                (read if name in READ_TOOLS else edited)[p] += 1
             elif name in SHELL_TOOLS:
                 cmd = a.get("command")
                 if isinstance(cmd, str):
@@ -941,6 +1235,8 @@ def package_skeleton(meta, facts):
         f"- 来源会话 `{meta['session_id']}`{id_note(meta)}"
         f",第 {meta['start']} ~ {meta['end']} 个用户发言(共 {meta['total']} 个)",
     ]
+    if meta.get("source") == "dsh":
+        lines.append("- 来源:dsh 会话导出(session.v4.jsonl)")
     if meta.get("project_dir"):
         lines.append(f"- 工作目录 `{meta['project_dir']}`")
     if meta.get("span"):
@@ -1081,7 +1377,58 @@ def positive_int(value):
 
 # ---------- 子命令 ----------
 
-def cmd_list() -> int:
+def dsh_logs():
+    """本机 dsh 会话,按 mtime 倒序。会话目录名就是会话 ID。"""
+    rows = []
+    for name in (DSH_LOG_ZSTD, DSH_LOG_NAME):
+        rows.extend(p for p in DSH_SESSIONS.glob(f"*/*/{name}") if p.is_file())
+    return sorted(rows, key=lambda p: p.stat().st_mtime, reverse=True)
+
+
+def find_dsh_log(session_id: str):
+    """按 ID 找 dsh 会话,返回 (状态, 命中列表, 备注)。前缀匹配同样要 ID 够长。"""
+    exact = [p for p in dsh_logs() if p.parent.name == session_id]
+    if exact:
+        return ("ok", exact, "")
+    if len(session_id) < 8:
+        return ("none", [], "")
+    partial = [p for p in dsh_logs() if p.parent.name.startswith(session_id)]
+    if len(partial) == 1:
+        return ("ok", partial, "")
+    if len(partial) > 1:
+        return ("ambiguous", partial, "")
+    return ("none", [], "")
+
+
+def dsh_log_in(path: Path):
+    """给一个目录,找出里面那本 dsh 日志(解压后的导出目录就是这种形状)。
+
+    先看目录本身,再看往下**一层**:有些工具解压时会多套一层以会话 ID 命名的
+    目录。往下只认唯一那一本——命中多本就返回 None,让调用方报错,不替用户挑。
+    """
+    for name in (DSH_LOG_ZSTD, DSH_LOG_NAME):
+        cand = path / name
+        if cand.is_file():
+            return cand
+    deeper = []
+    for name in (DSH_LOG_ZSTD, DSH_LOG_NAME):
+        deeper.extend(p for p in path.glob(f"*/{name}") if p.is_file())
+    return deeper[0] if len(deeper) == 1 else None
+
+
+def cmd_list(args) -> int:
+    source = args.source
+    if source == "dsh":
+        rows = dsh_logs()
+        if not rows:
+            print(f"没有找到任何 dsh 会话记录。检查 DSH_HOME 或 --path。({DSH_SESSIONS})")
+            return 1
+        print(f"最近的 dsh 会话(共 {len(rows)} 个,只显示最近 20 个):\n")
+        for p in rows[:20]:
+            title = read_dsh_title_file(p) or "(无标题)"
+            print(f"{p.parent.name}  {fmt_time(p.stat().st_mtime)}  {p.parent.parent.name}  {title}")
+        return 0
+
     rows = all_logs()
     if not rows:
         print("没有找到任何会话记录。检查 WORKBUDDY_HOME 或 --session。")
@@ -1125,6 +1472,23 @@ def resolve_session(args):
     对不上就是错误,不猜。退到别的会话要用户显式加 --newest——因为
     「导出成功」和「导出了你要的那条」是两件事,而后者错了没人看得出来。
     """
+    # --path 直接给文件,不走任何定位:用户已经指明是哪一本了。
+    if args.path:
+        p = Path(args.path).expanduser()
+        if p.is_dir():
+            inner = dsh_log_in(p)
+            if inner:
+                p = inner
+        if not p.exists():
+            return None, f"路径不存在:{p}"
+        if p.is_dir():
+            return None, (f"这是个目录,里面没有 {DSH_LOG_NAME}:{p}\n"
+                          "指到解压出来的会话目录,或者直接给 zip。")
+        return p, ""
+
+    if args.source == "dsh":
+        return resolve_dsh(args)
+
     explicit = bool(args.session)
     session_id = args.session or os.environ.get("CODEBUDDY_SESSION_ID")
 
@@ -1162,6 +1526,39 @@ def resolve_session(args):
     return hits[0], note
 
 
+def resolve_dsh(args):
+    """在 ~/.dsh/sessions 里按 ID 找。判据和 WorkBuddy 那边一样:不猜。"""
+    session_id = args.session or ""
+    if session_id and not re.fullmatch(r"[A-Za-z0-9._\-]+", session_id):
+        return None, ("会话 ID 只能含字母、数字和 - _ .  "
+                      f"(收到 {session_id!r};带路径分隔符会把 --session 变成任意文件读取)")
+
+    def fallback(reason: str):
+        rows = dsh_logs()
+        if args.newest and rows:
+            return rows[0], f"{reason};已按 --newest 退到「{rows[0].parent.name}」"
+        print(reason, file=sys.stderr)
+        print("要指定某一本就先 --list --source dsh 挑;要最近的就加 --newest;"
+              "也可以 --path 直接给导出包。最近的 dsh 会话:", file=sys.stderr)
+        for p in rows[:5]:
+            print(f"  {p.parent.name}  {fmt_time(p.stat().st_mtime)}  "
+                  f"{read_dsh_title_file(p) or '(无标题)'}", file=sys.stderr)
+        return None, ""
+
+    if not session_id:
+        return fallback("没有给会话 ID")
+
+    status, hits, note = find_dsh_log(session_id)
+    if status == "ambiguous":
+        print(f"「{session_id}」匹配到 {len(hits)} 个 dsh 会话,不猜。用更长的 ID:", file=sys.stderr)
+        for p in hits[:10]:
+            print(f"  {p.parent.name}", file=sys.stderr)
+        return None, ""
+    if status == "none":
+        return fallback(f"找不到 dsh 会话 {session_id} 的日志")
+    return hits[0], note
+
+
 @dataclass
 class Session:
     """被导出的那一份会话:原文记录 + 已经切成轮次的主线。"""
@@ -1176,6 +1573,16 @@ class Session:
     # 日志里没有 sessionId,id 是文件名顶上去的。交付物里要标出来,
     # 否则读包的人分不清「日志说的 ID」和「我们猜的 ID」。
     id_from_filename: bool = False
+    # 来源:workbuddy / dsh。header 里要写出来——两个来源的包长得一模一样,
+    # 半年后没人分得清哪个是从哪导的。
+    source: str = "workbuddy"
+    # dsh 把工作目录写在 header 里,比 WorkBuddy 的「取众数」硬得多。
+    cwd: str = ""
+    calls: int = 0
+    # dsh:被白名单挡掉的非用户消息条数 / 压缩检查点处数。两者都要写进 header,
+    # 否则「静默少吃」在纸面上看不出来。
+    ignored: int = 0
+    compactions: int = 0
 
 
 def open_session(args):
@@ -1192,11 +1599,23 @@ def open_session(args):
     if note:
         print(f"({note})", file=sys.stderr)
 
+    source = args.source if args.source != "auto" else sniff_source(path)
+    if source == "dsh":
+        return open_dsh_session(path)
+    if source != "workbuddy":
+        print(f"认不出这是哪种会话日志:{path}", file=sys.stderr)
+        print("用 --source workbuddy|dsh 显式指定,或换个文件。", file=sys.stderr)
+        return None, 2
+    return open_workbuddy_session(path)
+
+
+def open_workbuddy_session(path: Path):
     records = load_records(path)
     turns = build_turns(records)
     if not turns:
         print("这个会话里没有可提取的对话。", file=sys.stderr)
-        print("如果日志不是 WorkBuddy 格式(比如装进了 Claude Code),提取会全部落空。", file=sys.stderr)
+        print("如果日志不是 WorkBuddy 格式(比如 dsh 导出的),用 --source dsh 或 --path 指过去。",
+              file=sys.stderr)
         return None, 2
 
     sid, guessed = session_identity(path, records)
@@ -1207,7 +1626,46 @@ def open_session(args):
         # 两处对不上看着就像脚本写错了。
         print(f"(日志里的 sessionId 是 {sid},和文件名 {path.stem} 不一致;来源会话按日志写)",
               file=sys.stderr)
-    return Session(sid, records, turns, read_title(records), path.stem, guessed), 0
+    calls = sum(1 for r in records if r.get("type") == "function_call")
+    return Session(sid, records, turns, read_title(records), path.stem, guessed,
+                   calls=calls), 0
+
+
+def open_dsh_session(path: Path):
+    try:
+        records = load_records(path)
+    except ZstdUnavailable as e:
+        print(str(e), file=sys.stderr)
+        return None, 2
+    except (OSError, ValueError) as e:
+        print(f"读不了这份日志:{path}\n  {e}", file=sys.stderr)
+        return None, 2
+
+    turns, stats = build_turns_dsh(records)
+    if not turns:
+        print("这份 dsh 会话里没有用户发言,提取会全部落空。", file=sys.stderr)
+        print(f"(日志里有 {stats['ignored']} 条非用户消息,没有一条 source.kind=user)",
+              file=sys.stderr)
+        return None, 2
+
+    header = read_dsh_header(records)
+    raw_id = header.get("id") if isinstance(header.get("id"), str) else ""
+    raw_id = raw_id.strip()
+    guessed = not raw_id
+    sid = raw_id or dsh_stem(path, "")
+    cwd = header.get("cwd") if isinstance(header.get("cwd"), str) else ""
+    if guessed:
+        print(f"(日志里没有会话 id,来源会话按文件名填:{sid})", file=sys.stderr)
+    if stats["unknown"]:
+        kinds = ",".join(f"{k}({n} 条)" for k, n in stats["unknown"].most_common())
+        print(f"(遇到没见过的 source.kind:{kinds};已按注入丢弃)", file=sys.stderr)
+
+    return Session(
+        id=sid, records=records, turns=turns, title=read_dsh_title(records),
+        stem=dsh_stem(path, sid), id_from_filename=guessed, source="dsh",
+        cwd=cwd.strip(), calls=stats["calls"],
+        ignored=stats["ignored"], compactions=stats["compactions"],
+    ), 0
 
 
 def session_identity(path: Path, records):
@@ -1239,6 +1697,9 @@ def build_parser():
         epilog="读全量的判据不是轮数,是「包的四个待填节能不能写出内容」。",
     )
     ap.add_argument("--session", "-s", help="会话 ID,默认取当前会话(CODEBUDDY_SESSION_ID)")
+    ap.add_argument("--path", help="直接给文件:dsh 导出 zip、解压目录,或 session.v4.jsonl(.zstd)")
+    ap.add_argument("--source", choices=["auto", "workbuddy", "dsh"], default="auto",
+                    help="日志来源;给了 --path 时按内容认,不给时按 workbuddy 找")
     ap.add_argument("--list", "-l", action="store_true", help="列出所有项目最近的会话")
     ap.add_argument("--outline", "-o", action="store_true", help="只列用户发言,挑分叉点用")
     ap.add_argument("--from", dest="start", type=positive_int, default=None,
@@ -1264,6 +1725,8 @@ def validate_args(ap, args):
         ap.error("--force 只对 --package 有意义:它管的是「不要覆盖已有的包」")
     if args.stdout and args.out:
         ap.error("--stdout 与 --out 互斥:一个往屏幕写,一个往文件写")
+    if args.path and args.session:
+        ap.error("--path 与 -s 互斥:一个是给文件,一个是给会话 ID")
 
 
 def compute_range(args, total):
@@ -1300,14 +1763,27 @@ def is_partial(meta) -> bool:
 
 def document_header(meta, calls, compact):
     """导出的文件头。meta 里的会话 ID / 工作目录 / 时间跨度是模型猜不出来的真事实。"""
+    is_dsh = meta.get("source") == "dsh"
     lines = [
         f"{EXPORT_HEAD}{meta['title'] or '(无标题)'}",
         "",
         f"- 会话 ID:`{meta['session_id']}`{id_note(meta)}",
+    ]
+    if is_dsh:
+        lines.append("- 来源:dsh 会话导出(session.v4.jsonl)")
+    lines += [
         f"- 工作目录:`{meta['project_dir'] or '未知'}`",
         f"- 时间:{meta['span']}",
         f"- 全量:用户发言 {meta['total']} 次,工具调用 {calls} 次",
     ]
+    if is_dsh:
+        # 丢了多少必须写出来。白名单之外的东西不进正文是对的,但「不进」和
+        # 「少吃了」在纸面上必须能分开——不写这一行,两者长得一模一样。
+        # 压缩检查点单独数,不混进「非用户消息」以外的说法里(见 GLOSSARY)。
+        line = f"- 忽略:非用户消息 {meta.get('ignored', 0)} 条"
+        if meta.get("compactions"):
+            line += f",其中压缩检查点 {meta['compactions']} 处(原文完整保留)"
+        lines.append(line)
     if compact:
         lines.append(f"- 模式:压缩版(单条助手 {COMPACT_SAY} 字、单轮 {COMPACT_TURN} 字、用户 {COMPACT_USER} 字)")
     if is_partial(meta):
@@ -1390,7 +1866,7 @@ def main():
     if args.check:
         return check_package(args.check)
     if args.list:
-        return cmd_list()
+        return cmd_list(args)
     validate_args(ap, args)
 
     sess, code = open_session(args)
@@ -1407,17 +1883,21 @@ def main():
         print(f"从第 {start} 个发言开始没有内容(总共只有 {total} 个)。", file=sys.stderr)
         return 2
 
-    calls = sum(1 for r in sess.records if r.get("type") == "function_call")
+    calls = sess.calls
     meta = {
         "session_id": sess.id,
         "file_stem": sess.stem,
         "id_from_filename": sess.id_from_filename,
         "title": sess.title,
-        "project_dir": read_cwd(sess.records),
+        # dsh 的 header 里就有 cwd;没有才退回「取众数」。留空比填错好。
+        "project_dir": sess.cwd or read_cwd(sess.records),
         "start": start,
         "end": end,
         "total": total,
         "span": segment_span(sess.turns, start, end),
+        "source": sess.source,
+        "ignored": sess.ignored,
+        "compactions": sess.compactions,
     }
     doc = "\n".join(document_header(meta, calls, args.compact)) + "\n\n---\n\n" + body
 

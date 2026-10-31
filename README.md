@@ -1,8 +1,10 @@
 # workbuddy-fork
 
-给 **WorkBuddy 桌面端**补一个「上下文分叉」技能。
+给 **WorkBuddy** 和 **dsh（DeepSeek Harness）** 补一个「上下文分叉」技能。
 
-WorkBuddy 桌面端没有原生 fork（只有 CLI 有 `/branch`）。这个技能把当前对话从磁盘读出来、剥掉平台注入、压成一份**能直接粘进新对话的 prompt**——背景全带走，新任务开局不用重新交代。
+两个客户端都没有原生 fork（WorkBuddy 只有 CLI 侧有 `/branch`）。这个技能把当前对话从磁盘读出来、剥掉平台注入、压成一份**能直接粘进新对话的 prompt**——背景全带走，新任务开局不用重新交代。
+
+默认读 WorkBuddy 的会话；在 dsh 里跑要带 `--source dsh`，或者用 `--path` 直接指导出包（来源按内容自动认）。
 
 ```
 旧对话 → 一条命令导出 → 自动出骨架 → 填成人话 → 整段粘进新任务
@@ -37,6 +39,19 @@ Copy-Item -Recurse .\workbuddy-fork "$env:USERPROFILE\.workbuddy\skills\fork"
 
 重启 WorkBuddy。左侧技能面板里能看到 `fork` 就装好了。
 
+### dsh（DeepSeek Harness）
+
+同一个技能目录，换个位置：
+
+| 系统 | 路径 |
+|---|---|
+| Windows | `%USERPROFILE%\.dsh\skills\fork\` |
+| macOS / Linux | `~/.dsh/skills/fork/` |
+
+`scripts/sync-skill.sh` 会一起同步两个目标——`~/.dsh/skills/` 不存在时自动跳过，没装 dsh 的机器上不会凭空多出目录。
+
+在 dsh 里读 `.zstd` 压缩的活日志需要 **Python 3.14+** 或 `pip install zstandard`。都没有时脚本报错退出，不会给你一份空包。不想装依赖就用应用里的「导出会话」拿 zip，再用 `--path` 指过去。
+
 ### 开发时：让 clone 的改动生效
 
 如果你有一份 clone、又在 `skills/` 下放了一份副本，**两处不会自动同步**——push 完忘了复制，跑的还是旧代码，而且没有任何提示。装一次钩子就解决：
@@ -68,9 +83,13 @@ python scripts/corpus_check.py                  # 扫本机全部真实会话,�
 python scripts/corpus_check.py --save base.json # 存基线
 python scripts/corpus_check.py --compare base.json  # 改完之后比,任何一项变少就是回归
 python scripts/corpus_check.py --equiv HEAD~1   # 和旧版逐字节比输出,证明重构等价
+
+python scripts/corpus_check.py --source dsh     # 扫本机全部 dsh 会话(默认 DSH_HOME)
 ```
 
 单测覆盖不到「真实语料里有没有误伤」这件事——它只能靠真实会话。改完剥离规则跑一次，看 `计入发言` 有没有掉。
+
+dsh 那边的指标不一样：没有「体外残留」这种概念，换成一个更硬的不变量——**计入发言 == 原始发言、整条丢掉 == 0、幽灵发言 == 0**，外加「未认识的 `source.kind` == 0」。任何一项破了就直接非零退出。
 
 ### 怎么让 AI 用上它
 
@@ -86,19 +105,19 @@ python scripts/corpus_check.py --equiv HEAD~1   # 和旧版逐字节比输出,�
 
 ### 其他 agent 框架
 
-**开箱只支持 WorkBuddy。** 因为脚本读的是 WorkBuddy 的会话日志格式：
+**支持 WorkBuddy 和 dsh 两种日志。**
 
-- 位置：`~/.workbuddy/projects/<项目slug>/<sessionId>.jsonl`
-- 每行一条 JSON，用户消息是 `{type:"message", role:"user", content:[{type:"input_text", text}]}`
-- 时间戳是毫秒整数
+dsh 的会话格式和 WorkBuddy 完全不同，所以走的是另一条适配分支（`build_turns_dsh`），不是同一套字段映射：
 
-Claude Code、Cursor 等框架的日志格式和路径都不同，装到 `~/.claude/skills/` 里能加载但读不到会话。要适配需要改 `scripts/fork.py` 里这三个地方：
+| | WorkBuddy | dsh |
+|---|---|---|
+| 日志位置 | `~/.workbuddy/projects/<slug>/<id>.jsonl` | `~/.dsh/sessions/<slug>/<id>/session.v4.jsonl.zstd` |
+| 压缩 | 明文 | zstd（导出包是明文 zip） |
+| 用户消息 | `{type:"message", role:"user", content:[…]}` | `{type:"user/message", data:{content:[…], source:{kind}}}` |
+| 区分「谁在说话」 | 靠 `<user_query>` 切体内外，再按标签剥 | 靠 `data.source.kind`：只有 `user` 是人话 |
+| 工具调用 | `type:"function_call"` | `type:"tool/ptc-dispatch"`（`tool/call` 里只有 `run_code` 容器） |
 
-| 函数 | 改什么 |
-|---|---|
-| `PROJECTS_DIR` | 日志目录（支持 `WORKBUDDY_HOME` 环境变量覆盖） |
-| `msg_text()` / `part_text()` | 消息字段映射 |
-| `rec_ts()` | 时间戳单位（毫秒 → ISO 字符串要额外解析） |
+Claude Code、Cursor 等其它框架仍然不支持：装到 `~/.claude/skills/` 里能加载，但读不到会话。要加一种来源，照着 `build_turns_dsh` 再写一个适配器——它产出与 `build_turns` 同一套 turn schema，渲染、`--from`、包骨架都不用动。
 
 ## 用起来什么样
 
@@ -166,6 +185,27 @@ AI：（读日志、剥注入、出包）
 
 **`@long-text:"预览"` 按「后面跟没跟引文块」分两种处理。** 跟着 `<long_text_quote>` 时，预览串就是正文前 20 字的重复，删掉；没跟引文块时，这串预览是这个引用留下的唯一痕迹，换成 `[长引用 「预览」]` 留着。判据是机械的（同一个 `<user_query>` 体内有没有引文块），不猜语义——否则用户在正文里讨论这个标记本身时，原话会被吃成一对空反引号。
 
+### 2.5 dsh 走的是另一套：按来源，不按标签
+
+dsh 的日志里，注入和原话是同一个结构（都是 `user/message`），正文里也未必有标签——按上面那套正则会**全部空转**。多出来的信号是 `data.source.kind`：
+
+| `kind` | 是什么 |
+|---|---|
+| `user` | 用户真说的话（还带 `rpcId` + `clientTimeZone`） |
+| `ptc-mode` | `read_image` 的工具回执，不是人话 |
+| `agent-instructions` / `skill-catalog` / `skill-invocation` / `runtime-context` / `plugin:*` | 平台注入 |
+| `agent-message` / `subagent-settled` | 子代理的往来，不是用户说的 |
+| `compact-checkpoint` | 压缩摘要 |
+
+只认 `kind == "user"`，其余一律不进正文，**但会被数出来**：header 的 `- 忽略:注入 N 条` 就是它们。实测本机 118 个 dsh 会话：353 条真发言全部计入，挡掉 1007 条注入，0 条误判。
+
+两条容易误会的地方：
+
+- **压缩检查点不导出，原文全留。** dsh 上下文满时会生成一份摘要并用 `surfaceOp` 标记「这段被替换了」。我们只读原始事件，不重放替换——摘要是原文的机器摘要，信息量严格更小。见 `docs/adr/0008`。
+- **工具行来自 `tool/ptc-dispatch`，不是 `tool/call`。** 后者里只有 `run_code` 这个容器，露出来等于每轮都写一句「跑了一段代码」。
+
+新出现一种 `kind` 时，脚本会把它当注入丢掉，同时在 stderr 打一行「遇到没见过的 source.kind」——**不会静默**。`corpus_check --source dsh` 会把这类情况直接判成失败。
+
 ### 3. 出骨架
 
 机械部分自动填好：改过的文件（带次数）、跑过的命令、报错原文、查过的链接、工作目录、时间跨度。
@@ -206,8 +246,10 @@ python scripts/fork.py [选项]
 | `--force` | 允许覆盖已存在的包（默认不覆盖，防止把填好的清掉） |
 | `--check FILE` | 按节报篇幅占比 |
 | `--session <id>` / `-s` | 指定会话（默认当前会话） |
+| `--path PATH` | 直接给文件：dsh 导出 zip、解压目录，或 `session.v4.jsonl(.zstd)`。来源按内容自动认 |
+| `--source {auto,workbuddy,dsh}` | 日志来源。给了 `--path` 时按内容认，不给时默认按 workbuddy 找 |
 | `--newest` | 会话 ID 对不上时，显式改用最近活跃的会话 |
-| `--list` / `-l` | 列出各项目最近的会话 |
+| `--list` / `-l` | 列出各项目最近的会话（配 `--source dsh` 列 dsh 的） |
 | `--out PATH` | 指定输出路径（默认系统临时目录 `workbuddy-fork/`） |
 | `--stdout` | 打到标准输出。文件是完整的，只是 Bash 工具的回显有上限，长会话看起来会像被截断 |
 
@@ -240,7 +282,8 @@ python scripts/fork.py [选项]
 ## 限制
 
 - **不是真分叉。** 不会自动建任务、不会自动切过去，旧线也不会因为分叉而改变。两边不同步，是两条独立的时间线。
-- **只支持 WorkBuddy。** 见上面「其他 agent 框架」。
+- **只支持 WorkBuddy 和 dsh。** 其它框架见上面「其他 agent 框架」。
+- **dsh 读活日志要 zstd。** Python 3.14+ 或 `pip install zstandard`，缺了会报错退出（不会给空包）。导出包走 `--path` 不需要依赖。
 - **临时文件会被清。** 要长期留档就 `--out` 到固定目录。
 - **后台 / 子代理会话可能不落盘。** 这种会话拿不到日志。脚本会报错并列出最近的几个会话，确认是哪个之后用 `--session` 指定；要最近那个就用 `--newest`。
 

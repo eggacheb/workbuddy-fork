@@ -4,15 +4,16 @@
 
 ## 这个仓库是什么
 
-给 **WorkBuddy 桌面端**补一个「上下文分叉」技能:把本地会话日志读出来、剥掉平台注入、压成一份能整段粘进新对话的上下文包。
+给 **WorkBuddy** 和 **dsh(DeepSeek Harness)** 补一个「上下文分叉」技能:把本地会话日志读出来、剥掉平台注入、压成一份能整段粘进新对话的上下文包。
 
-**不做真 fork。** 桌面端闭源,碰不到会话存储;这里只解决「别丢背景」。
+**不做真 fork。** 两个客户端都碰不到会话存储写入口;这里只解决「别丢背景」。两种日志格式差得远,各有一个适配器(`build_turns` / `build_turns_dsh`),产出同一套 turn schema,渲染层只写一份。
 
 | 文件 | 是什么 |
 |---|---|
-| `scripts/fork.py` | 工具本体。单文件,无第三方依赖 |
-| `SKILL.md` | 技能说明。WorkBuddy 加载的是这一份 |
+| `scripts/fork.py` | 工具本体。单文件。唯一可选依赖是读 dsh 活日志用的 zstd(Python 3.14+ 自带,否则 `zstandard`);两个都没有时**报错退出**,不会出空包 |
+| `SKILL.md` | 技能说明。WorkBuddy / dsh 加载的都是这一份 |
 | `README.md` | 用户文档、安装、命令表 |
+| `GLOSSARY.md` | 术语。发言 / 轮 / 注入 / 压缩检查点 / 来源 |
 | `tests/` | 表征测试,`unittest`,不引第三方库 |
 
 ## 跑起来
@@ -20,18 +21,23 @@
 ```bash
 python scripts/fork.py --outline                # 列当前会话的用户发言,挑分叉点
 python scripts/fork.py --compact --package      # 导出 + 出包骨架
+python scripts/fork.py --path x.zip --outline    # dsh 导出包(来源按内容认)
+python scripts/fork.py --source dsh --newest -o  # 本机最近的 dsh 会话
 python -m unittest discover -s tests -v         # 全部测试
 python scripts/corpus_check.py                  # 全库回归:发言数 / 占位数 / 整条丢掉数
+python scripts/corpus_check.py --source dsh     # dsh 全库回归:原始 == 计入 / 未认识的 kind
 python scripts/corpus_check.py --equiv HEAD~1   # 和旧版逐字节比输出,证明改动等价
 ```
 
 单测只覆盖想得到的边界;**`corpus_check` 跑的是这台机器上真实发生过的全部会话**。改完剥离规则先跑它,再看数字有没有掉。它也可以 `--save` 存基线、`--compare` 再比,任何一项变差都算回归:吃内容的指标(计入发言、长引用占位)看**变少**,「体外残留」反过来看**变多**——它数的是平台往 `<user_query>` 外面塞、而规则还没认出来的字。
 
-会话日志在 `~/.workbuddy/projects/<项目slug>/<会话Id>.jsonl`,目录可用 `WORKBUDDY_HOME` 覆盖。测试全部靠这个变量指到临时 fixture,**绝不读真实会话**——否则结果取决于这台机器上聊过什么。
+WorkBuddy 的会话日志在 `~/.workbuddy/projects/<项目slug>/<会话Id>.jsonl`,目录可用 `WORKBUDDY_HOME` 覆盖;dsh 的在 `~/.dsh/sessions/<项目slug>/<会话Id>/session.v4.jsonl.zstd`,用 `DSH_HOME` 覆盖。测试全部靠这两个变量指到临时 fixture,**绝不读真实会话**——否则结果取决于这台机器上聊过什么。
+
+dsh 的 `corpus_check` 判的是不变量而不是方向:**计入发言 == 原始发言、整条丢掉 == 0、幽灵发言 == 0、未认识的 `source.kind` == 0**,任何一条破了就非零退出。`--equiv` 只支持 WorkBuddy——老版本 fork.py 根本不认 dsh,没有可比对象。
 
 `pre-commit` 在提交前跑全量测试,不过就拦下(`scripts/sync-skill.sh --install-hooks` 装的)。CI 跑同一份,runner 用 `windows-latest`:中文管道编码那条用例只有在 Windows 上才有意义。
 
-改完 clone 里的代码要同步到 WorkBuddy 实际加载的 `~/.workbuddy/skills/fork/`:`scripts/sync-skill.sh`。`post-commit` / `post-merge` 钩子会自动跑它(装钩子:`scripts/sync-skill.sh --install-hooks`)。**不同步就是跑旧代码,而且没有任何提示。**
+改完 clone 里的代码要同步到实际加载的目录:`scripts/sync-skill.sh` 会同时写 `~/.workbuddy/skills/fork/` 和 `~/.dsh/skills/fork/`(后者不存在时跳过)。`post-commit` / `post-merge` 钩子会自动跑它(装钩子:`scripts/sync-skill.sh --install-hooks`)。**不同步就是跑旧代码,而且没有任何提示。**
 
 ## 改动纪律
 
@@ -43,6 +49,7 @@ python scripts/corpus_check.py --equiv HEAD~1   # 和旧版逐字节比输出,�
 - **`<user_query>` 体内是用户原话。** 只摘附件、不碰排版。缩进和空行必须原样留着,否则代码块对齐和 Node 栈的层级会被压平。压空行这条加过又拆了,理由见 `docs/adr/0003-体内不压空行.md`。
 - **有 `<user_query>` 的发言,体外整段都是注入。** 判据是位置(这一轮有没有 query),不是「像不像注入」——按措辞认,平台换一句就漏(`de650383` 那 420 字就是这么漏的)。没有 query 的老消息体外就是用户原话,一个字不能动。见 `docs/adr/0005-有query时体外整段当注入.md`。
 - **标记名的字符集只收 ASCII。** 中文正文常紧贴标记(`@image#1:a.png，这样改对不对`),按「到空白为止」去抓会把整句话当文件名删掉。宁可丢一个中文文件名,也不能吃用户原话。
+- **dsh 的判据是 `source.kind`,不是文本。** 那边注入和原话同结构、正文里也未必有标签,按标签剥等于全程空转。只认 `kind == "user"`,其余按来源挡掉并计数——header 的「忽略 N 条」和 stderr 的「没见过的 kind」是这个判据的唯一可见证据。两种来源的清洗哲学不通用,别把 dsh 的消息喂进 `clean_user`。见 `docs/adr/0007-dsh按source-kind白名单.md`。
 - **用户点过的东西不能删。** `@skill:` / `@"…"` / `@long-text:` 记的是「这句话是怎么来的」,新对话在仓库里查不回来,所以渲染成 `[技能 X]` / `[文件 目录/y.py]` / `[长引用 「X」]` 而不是清掉——代码块里也一样,理由见 `docs/adr/0001-标记在代码块里照常渲染.md`。`@"…"` 只认平台在 `<user_references>` 里列过的路径,见 `docs/adr/0002-只认平台盖章的文件引用.md`。
 - **会话定位不猜。** ID 对不上就报错并列出最近的会话,`--newest` 才显式降级。悄悄换成别的会话,用户从输出里看不出来。
 - **会话 ID 以日志里的 `sessionId` 为准。** 文件名可以改,接续会话的文件名和 ID 本来就不一致,所以 header 和包里的「来源会话」都不抄文件名。取不到才退回 `path.stem`,而退回必须在交付物里标出来——「日志说的」和「我们猜的」在纸面上不能长得一样。

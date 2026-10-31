@@ -42,6 +42,10 @@ FORK_PY = REPO / "scripts" / "fork.py"
 # 会话数会随聊天增长,原始消息数也是;所以只把「变少」当回归信号。
 GROWING = {"会话数", "原始 user 消息"}
 
+# dsh 那边的指标换一套:没有「体内体外」,判据是 source.kind 白名单(ADR-0007)。
+# 会随聊天增长的:会话数、原始发言、注入条数、压缩次数。
+DSH_GROWING = {"会话数", "原始发言", "注入了多少", "压缩检查点"}
+
 # 这一项反过来:**变多**才是坏消息。它数的是「有 query 的发言里,体外剥完还剩字」
 # 的条数——剩下的每个字都是平台塞进来而我们的规则没认出来的东西,或者是「真话被
 # 挪到 query 外面」的早期警报。纯 [图片] 占位不算(那是脚本自己渲染的)。
@@ -81,6 +85,110 @@ def collect(projects_dir: Path) -> dict:
             if not re.sub(r"<[^>]+>", "", said).strip():
                 stats["幽灵发言"] += 1
     return stats
+
+
+def dsh_logs_in(sessions_dir: Path):
+    for name in (fork.DSH_LOG_ZSTD, fork.DSH_LOG_NAME):
+        for p in sorted(sessions_dir.glob(f"*/*/{name}")):
+            if p.is_file():
+                yield p
+
+
+def collect_dsh(sessions_dir: Path) -> dict:
+    """dsh 的指标:白名单挡掉了多少、真发言有没有被顺手吃掉。
+
+    这里不用「体外残留」那套——dsh 没有体内外,判据是结构化的 source.kind。
+    换成三条不变量(原始 == 计入、整条丢掉 == 0、幽灵发言 == 0),任何一条
+    破了都说明真发言被规则误删,比 WorkBuddy 那边的方向判断还硬。
+    """
+    stats = {
+        "会话数": 0,
+        "原始发言": 0,
+        "计入发言": 0,
+        "整条丢掉": 0,
+        "幽灵发言": 0,
+        "空发言": 0,
+        "注入了多少": 0,
+        "压缩检查点": 0,
+        "未认识的 kind": 0,
+    }
+    for p in dsh_logs_in(sessions_dir):
+        stats["会话数"] += 1
+        try:
+            records = fork.load_records(p)
+        except (OSError, ValueError, fork.ZstdUnavailable) as e:
+            print(f"  跳过 {p}:{e}", file=sys.stderr)
+            continue
+
+        raw = 0
+        for r in records:
+            if r.get("type") != "user/message":
+                continue
+            if fork.dsh_kind(r) != fork.DSH_USER_KIND:
+                continue
+            if fork.dsh_text(fork.dsh_message(r)).strip():
+                raw += 1
+            else:
+                # 空的 kind=user 消息不进正文是对的,但数出来:否则「按设计丢」
+                # 和「规则误删」在指标上长得一样。
+                stats["空发言"] += 1
+        stats["原始发言"] += raw
+
+        turns, s = fork.build_turns_dsh(records)
+        stats["计入发言"] += len(turns)
+        stats["注入了多少"] += s["ignored"]
+        stats["压缩检查点"] += s["compactions"]
+        stats["未认识的 kind"] += sum(s["unknown"].values())
+        for t in turns:
+            if not re.sub(r"<[^>]+>", "", t["user"]).strip():
+                stats["幽灵发言"] += 1
+    stats["整条丢掉"] = max(0, stats["原始发言"] - stats["计入发言"])
+    return stats
+
+
+def dsh_problems(stats: dict):
+    """不变量:破一条就说明真发言被吃掉了。和基线无关,任何时候都要查。"""
+    out = []
+    if stats["原始发言"] != stats["计入发言"]:
+        out.append(f"原始发言 {stats['原始发言']} 条,计入 {stats['计入发言']} 条:"
+                   "有真发言没进导出。回原文核对这些条为什么被跳过。")
+    if stats["幽灵发言"]:
+        out.append(f"幽灵发言 {stats['幽灵发言']} 条:剥完只剩标签的仍被算成了发言。")
+    if stats["未认识的 kind"]:
+        out.append(f"有 {stats['未认识的 kind']} 条 source.kind 是脚本不认识的,已按注入丢弃。"
+                   "先确认那不是人话;是的话改 DSH_KNOWN_KINDS,不要放行。")
+    return out
+
+
+def report_dsh_problems(stats: dict):
+    problems = dsh_problems(stats)
+    for line in problems:
+        print(f"\n{line}")
+    return problems
+
+
+def compare_dsh(now: dict, base: dict) -> int:
+    rows, worse = [], []
+    for key, old in base.items():
+        new = now.get(key)
+        if new is None or key in DSH_GROWING:
+            continue
+        delta = new - old
+        rows.append((key, old, new, delta))
+        if delta < 0:
+            worse.append((key, old, new, delta))
+
+    for key, old, new, delta in rows:
+        mark = "  ← 变少了" if delta < 0 else ""
+        print(f"  {pad(key, 16)} {old:>7} → {new:>7}  ({delta:+d}){mark}")
+
+    bad = bool(report_dsh_problems(now))
+    if worse:
+        print(f"\n{len(worse)} 项指标变少,疑似吃掉了真实内容。逐条回原文核对。")
+        bad = True
+    if not bad:
+        print("\n没有指标变差。")
+    return 1 if bad else 0
 
 
 def display_width(text: str) -> int:
@@ -189,13 +297,18 @@ def equiv(ref: str, projects_dir: Path, limit: int) -> int:
 
 def main():
     ap = argparse.ArgumentParser(description="全库语料回归")
-    ap.add_argument("--home", help="覆盖 projects 目录(默认取 WORKBUDDY_HOME)")
+    ap.add_argument("--home", help="覆盖会话目录(默认:workbuddy 取 WORKBUDDY_HOME,sessions 取 DSH_HOME)")
+    ap.add_argument("--source", choices=["workbuddy", "dsh"], default="workbuddy",
+                    help="扫哪种日志,默认 workbuddy")
     ap.add_argument("--save", metavar="FILE", help="把当前数字存成基线")
     ap.add_argument("--compare", metavar="FILE", help="和基线比,任何一项变少就非零退出")
     ap.add_argument("--equiv", metavar="REF",
-                    help="和这个提交的 fork.py 比输出(如 HEAD~1)")
+                    help="和这个提交的 fork.py 比输出(如 HEAD~1);只支持 workbuddy")
     ap.add_argument("--limit", type=int, default=8, help="--equiv 比几个会话,默认 8")
     args = ap.parse_args()
+
+    if args.source == "dsh":
+        return run_dsh(args)
 
     projects_dir = Path(args.home) if args.home else fork.PROJECTS_DIR
     if not projects_dir.is_dir():
@@ -222,6 +335,40 @@ def main():
         return compare(stats, base)
 
     return 0
+
+
+def run_dsh(args) -> int:
+    """dsh 语料那一支:目录是 sessions/<项目>/<会话>/,日志是 zstd。"""
+    if args.equiv:
+        print("--equiv 只支持 workbuddy:dsh 是老版本 fork.py 根本不认的来源,没法逐字节比。",
+              file=sys.stderr)
+        return 2
+    root = Path(args.home) if args.home else fork.DSH_SESSIONS
+    if not root.is_dir():
+        print(f"找不到 dsh 会话目录:{root}", file=sys.stderr)
+        print("用 --home 指定,或检查 DSH_HOME。", file=sys.stderr)
+        return 2
+
+    stats = collect_dsh(root)
+    print(f"{root}\n")
+    print_stats(stats)
+
+    # 不变量任何时候都查,不是只在 --compare 时查:一次不带参数的回归跑完
+    # 照样要能红,否则「今天没问题」只是一句没人验证过的断言。
+    problems = report_dsh_problems(stats)
+
+    if args.save:
+        Path(args.save).write_text(json.dumps(stats, ensure_ascii=False, indent=2),
+                                   encoding="utf-8")
+        print(f"\n基线已存:{args.save}")
+        return 1 if problems else 0
+
+    if args.compare:
+        base = json.loads(Path(args.compare).read_text(encoding="utf-8"))
+        print(f"\n和基线比({args.compare}):")
+        return compare_dsh(stats, base)
+
+    return 1 if problems else 0
 
 
 if __name__ == "__main__":

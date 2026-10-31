@@ -6,7 +6,7 @@ argument-hint: "[要带走的重点,或从第几句开始]"
 
 # fork — 从对话中间开一条新线
 
-WorkBuddy 桌面端没有原生分叉。这个技能补的是 fork 真正有用的那部分:**别丢背景**。
+WorkBuddy 和 dsh(DeepSeek Harness)都没有原生分叉。这个技能补的是 fork 真正有用的那部分:**别丢背景**。
 
 它和 `handoff` 的分工:handoff 靠模型回忆,上下文被 compact 过就丢细节;这个技能**从磁盘的 jsonl 读全量原文**,聊多久都完整。
 
@@ -22,6 +22,26 @@ WorkBuddy 桌面端没有原生分叉。这个技能补的是 fork 真正有用�
 ## 步骤
 
 下面的命令按 `python` + `$HOME` 写。macOS/Linux 上 Python 常叫 `python3`;`cmd.exe` 里 `$HOME` 不展开,换成 `%USERPROFILE%`。不确定先跑 `python -V` 试一次。
+
+### 0. 先认来源
+
+脚本默认找 WorkBuddy 的会话(`~/.workbuddy/projects/`)。**在 dsh 里跑要显式带 `--source dsh`**——不给 `--path` 时它不会自己去猜你在哪个工具里。
+
+| 场景 | 命令 |
+|---|---|
+| dsh 当前目录最近的会话 | `--source dsh --newest` |
+| dsh 指定会话 | `--source dsh -s <会话id>`(id 形如 `session-2f89b65e-…`) |
+| dsh 导出包(zip / 解压目录) | `--path <路径>`(来源按内容自动认,不用带 `--source`) |
+| 看看有哪些 dsh 会话 | `--source dsh --list` |
+
+dsh 的会话目录是 `~/.dsh/sessions/<项目slug>/<会话id>/session.v4.jsonl.zstd`,会话 ID 就是那个目录名。
+
+读 `.zstd` 需要 Python 3.14+ 或者 `pip install zstandard`。**两个都没有时脚本报错退出**,不会给你一份空包。装了 dsh 但不想装依赖,就在应用里把会话导出成 zip,用 `--path` 指过来。
+
+dsh 的正文和 WorkBuddy 长得不一样,但**你不用管细节**,只要知道两件事:
+
+- 平台注入按 `source.kind` 挡掉,不靠文本猜。header 会写 `- 忽略:注入 N 条`,这个数字对得上就说明没吃错东西。
+- 压缩检查点(上下文满了自动生成的摘要)不导出,正文用原文。header 会写 `- 压缩检查点 N 处(原文完整保留)`。
 
 ### 1. 确认分叉点
 
