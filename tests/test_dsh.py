@@ -44,6 +44,20 @@ def 标准会话():
     ]
 
 
+def 子代理会话():
+    """子代理把报告发回主代理:`agent-message`,不是用户说的,但里面是审阅结论。"""
+    return [
+        dsh_header(cwd="D:\\code\\demo"),
+        dsh_title("带审阅的会话"),
+        dsh_turn(1),
+        dsh_user(2, "帮我审一下"),
+        dsh_assistant(3, text="我派个子代理去看。"),
+        dsh_user(4, "Agent 77ae86c8-0a5c-42d8-af58-37d75c30a1d5 sent a message: \n"
+                    "Standards 轴复核:硬违规 1 条,引用标准原文", kind="agent-message"),
+        dsh_assistant(5, text="收到,按它说的改。"),
+    ]
+
+
 def 直接模式会话():
     """没有 PTC:tool/call 里就是真工具本身(真实样本 session-195b8a08 就是这样)。"""
     return [
@@ -143,6 +157,34 @@ class 清洗(_DshHome):
         self.assertIn("- 改过的文件", text)
         self.assertIn("a.py", text)
         self.assertIn("b.py", text)
+
+
+class 子代理(_DshHome):
+    def test_默认不包子代理消息(self):
+        # 默认丢掉:它是执行细节,主代理的 text 里通常已有结论
+        r = self.跑("--stdout", "--source", "dsh", "-s", self.sid, records=子代理会话())
+
+        self.assertEqual(r.returncode, 0, err_text(r))
+        out = out_text(r)
+        self.assertNotIn("[子代理", out)
+        self.assertNotIn("Standards 轴复核", out)
+        self.assertIn("- 忽略:非用户消息 1 条", out)
+        self.assertNotIn("子代理消息:", out)
+
+    def test_加开关后子代理消息进正文(self):
+        r = self.跑("--stdout", "--source", "dsh", "-s", self.sid,
+                    "--with-agent-notes", records=子代理会话())
+
+        self.assertEqual(r.returncode, 0, err_text(r))
+        out = out_text(r)
+        self.assertIn("[子代理 77ae86c8]", out)
+        self.assertIn("Standards 轴复核", out)
+        # 它是助手侧的内容,不能凭空多出一个用户编号
+        self.assertIn("## [1] 用户", out)
+        self.assertNotIn("## [2] 用户", out)
+        # 进来了就要说一声,数字也得对得上
+        self.assertIn("子代理消息:1 条", out)
+        self.assertIn("- 忽略:非用户消息 0 条", out)
 
 
 class 压缩(_DshHome):

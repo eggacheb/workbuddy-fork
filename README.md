@@ -214,6 +214,8 @@ dsh 的日志里，注入和原话是同一个结构（都是 `user/message`）�
 - **压缩检查点不导出，原文全留。** dsh 上下文满时会生成一份摘要并用 `surfaceOp` 标记「这段被替换了」。我们只读原始事件，不重放替换——摘要是原文的机器摘要，信息量严格更小。见 `docs/adr/0008`。
 - **工具行来自两种记录，判据是结构不是名字。** PTC 模式下 `tool/call` 只是 `run_code` 容器，真工具挂在它的 `tool/ptc-dispatch` 下；直接模式下 `tool/call` 自己就是 `read`/`bash`。分法是「有没有派发挂在它下面」（`callId` 是否出现在某条 `ptc-dispatch` 的 `rootCallId` 里），容器不显示、真工具显示。按名字认 `run_code` 会在平台改名时静默漏掉整类工具——实测有 6 个会话是纯直接模式，只认 `ptc-dispatch` 时它们的工具数是 0。
 
+**子代理的报告默认不导出，但可以要。** `agent-message` 是子代理发回主代理的结论（本机 67 条），属于执行细节——主代理的 `text` 里通常已经有结论。审阅类子代理是例外：它的判断只活在报告里。加 `--with-agent-notes` 就会收进助手侧，带 `[子代理 前8位]` 署名，不占用用户发言的编号。实测一份会话全量 17.7k → 30.9k 字符。
+
 新出现一种 `kind` 时，脚本会把它当注入丢掉，同时在 stderr 打一行「遇到没见过的 source.kind」——**不会静默**。`corpus_check --source dsh` 会把这类情况直接判成失败。
 
 ### 3. 出骨架
@@ -258,6 +260,7 @@ python scripts/fork.py [选项]
 | `--session <id>` / `-s` | 指定会话（默认当前会话） |
 | `--path PATH` | 直接给文件：dsh 导出 zip、解压目录，或 `session.v4.jsonl(.zstd)`。来源按内容自动认 |
 | `--source {auto,workbuddy,dsh}` | 日志来源。给了 `--path` 时按内容认，不给时默认按 workbuddy 找 |
+| `--with-agent-notes` | dsh：把子代理发回的报告也收进正文（默认丢） |
 | `--newest` | 会话 ID 对不上时，显式改用最近活跃的会话 |
 | `--list` / `-l` | 列出各项目最近的会话（配 `--source dsh` 列 dsh 的） |
 | `--out PATH` | 指定输出路径（默认系统临时目录 `workbuddy-fork/`） |

@@ -46,6 +46,12 @@ DSH_LOG_ZSTD = DSH_LOG_NAME + ".zstd"
 DSH_USER_KIND = "user"
 # 认识的非用户 kind。不认识的也丢,但要在 stderr 说出来:默认丢 + 不出声,
 # 正是这个脚本历史上每个 P0 的形状。
+# 子代理发回主代理的报告。默认丢——它是执行细节,主代理的 text 里通常已有结论;
+# 但审阅类子代理的结论可能只在报告里,所以留一个显式开关。
+DSH_AGENT_KIND = "agent-message"
+# 平台给报告套的头:`Agent <uuid> sent a message: `。正文里换成一个短署名。
+AGENT_HEAD_RE = re.compile(r"\AAgent\s+([0-9a-fA-F-]{8,})\s+sent a message:\s*")
+
 DSH_KNOWN_KINDS = {
     "ptc-mode",
     "agent-instructions",
@@ -901,7 +907,18 @@ def dsh_containers(records) -> set:
     return roots
 
 
-def build_turns_dsh(records):
+def dsh_agent_note(text: str) -> str:
+    """`Agent <uuid> sent a message: …` → `[子代理 77ae86c8] …`。
+
+    只换掉平台加的那一层壳,正文一个字不动。
+    """
+    m = AGENT_HEAD_RE.match(text)
+    if m:
+        return f"[子代理 {m.group(1)[:8]}] {text[m.end():].strip()}"
+    return f"[子代理] {text.strip()}"
+
+
+def build_turns_dsh(records, include_agent=False):
     """dsh:只认 source.kind == "user" 的发言,其余按来源丢弃并计数。
 
     返回 (turns, stats)。turn dict 与 build_turns 同一套 schema,所以渲染、
@@ -911,7 +928,8 @@ def build_turns_dsh(records):
     按 turn 编号会把第二条吞进第一条,--from 从此指错地方。
     """
     turns, cur = [], None
-    stats = {"ignored": 0, "compactions": 0, "calls": 0, "unknown": Counter()}
+    stats = {"ignored": 0, "compactions": 0, "calls": 0, "agent_notes": 0,
+             "unknown": Counter()}
 
     containers = dsh_containers(records)
 
@@ -927,6 +945,14 @@ def build_turns_dsh(records):
                 cur = {"user": said, "blocks": [], "calls": [], "errors": [], "ts": dsh_ts(r)}
                 turns.append(cur)
                 continue
+            if include_agent and kind == DSH_AGENT_KIND and cur is not None:
+                body = dsh_text(dsh_message(r)).strip()
+                if body:
+                    # 记在助手侧:它是子代理干的活,不是用户说的,编号不能多一条
+                    cur["blocks"].append(("say", dsh_agent_note(body)))
+                    stats["agent_notes"] += 1
+                    continue
+
             stats["ignored"] += 1
             if kind == "compact-checkpoint":
                 stats["compactions"] += 1
@@ -1631,6 +1657,9 @@ class Session:
     # 否则「静默少吃」在纸面上看不出来。
     ignored: int = 0
     compactions: int = 0
+    # dsh --with-agent-notes:收进正文的子代理报告条数。收了多少也要写在纸上,
+    # 否则「开关没生效」和「本来就没有」看起来一样。
+    agent_notes: int = 0
 
 
 def open_session(args):
@@ -1649,7 +1678,7 @@ def open_session(args):
 
     source = args.source if args.source != "auto" else sniff_source(path)
     if source == "dsh":
-        return open_dsh_session(path)
+        return open_dsh_session(path, args.with_agent_notes)
     if source != "workbuddy":
         print(f"认不出这是哪种会话日志:{path}", file=sys.stderr)
         print("用 --source workbuddy|dsh 显式指定,或换个文件。", file=sys.stderr)
@@ -1683,7 +1712,7 @@ def open_workbuddy_session(path: Path):
                    calls=calls), 0
 
 
-def open_dsh_session(path: Path):
+def open_dsh_session(path: Path, with_agent_notes: bool = False):
     try:
         records = load_records(path)
     except ZstdUnavailable as e:
@@ -1695,7 +1724,7 @@ def open_dsh_session(path: Path):
         print(f"读不了这份日志:{path}\n  {type(e).__name__}: {e}", file=sys.stderr)
         return None, 2
 
-    turns, stats = build_turns_dsh(records)
+    turns, stats = build_turns_dsh(records, include_agent=with_agent_notes)
     if not turns:
         print("这份 dsh 会话里没有用户发言,提取会全部落空。", file=sys.stderr)
         print(f"(日志里有 {stats['ignored']} 条非用户消息,没有一条 source.kind=user)",
@@ -1719,6 +1748,7 @@ def open_dsh_session(path: Path):
         stem=dsh_stem(path, sid), id_from_filename=guessed, source="dsh",
         cwd=cwd.strip(), calls=stats["calls"],
         ignored=stats["ignored"], compactions=stats["compactions"],
+        agent_notes=stats["agent_notes"],
     ), 0
 
 
@@ -1763,6 +1793,8 @@ def build_parser():
     ap.add_argument("--newest", action="store_true",
                     help="会话 ID 对不上时,改用最近活跃的会话(默认是报错,不猜)")
     ap.add_argument("--compact", action="store_true", help="压缩版:助手发言截断、工具调用只留次数")
+    ap.add_argument("--with-agent-notes", action="store_true",
+                    help="dsh:把子代理发回的报告也收进正文(默认丢)")
     ap.add_argument("--package", action="store_true", help="同时生成上下文包骨架")
     ap.add_argument("--force", action="store_true", help="允许覆盖已存在的上下文包")
     ap.add_argument("--check", metavar="FILE", help="按节报篇幅占比,指出哪节在膨胀")
@@ -1838,6 +1870,8 @@ def document_header(meta, calls, compact):
         if meta.get("compactions"):
             line += f",其中压缩检查点 {meta['compactions']} 处(原文完整保留)"
         lines.append(line)
+        if meta.get("agent_notes"):
+            lines.append(f"- 子代理消息:{meta['agent_notes']} 条(已包含在正文里)")
     if compact:
         lines.append(f"- 模式:压缩版(单条助手 {COMPACT_SAY} 字、单轮 {COMPACT_TURN} 字、用户 {COMPACT_USER} 字)")
     if is_partial(meta):
@@ -1926,6 +1960,9 @@ def main():
     sess, code = open_session(args)
     if sess is None:
         return code
+    if args.with_agent_notes and sess.source != "dsh":
+        # 开关对 WorkBuddy 没有对应物。不吭声等于让人以为它生效了。
+        print("(--with-agent-notes 只对 dsh 来源有效,这次没有作用)", file=sys.stderr)
 
     total = len(sess.turns)
     if args.outline:
@@ -1952,6 +1989,7 @@ def main():
         "source": sess.source,
         "ignored": sess.ignored,
         "compactions": sess.compactions,
+        "agent_notes": sess.agent_notes,
     }
     doc = "\n".join(document_header(meta, calls, args.compact)) + "\n\n---\n\n" + body
 
