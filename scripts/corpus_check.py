@@ -21,6 +21,7 @@ import argparse
 import json
 import os
 import re
+from collections import Counter
 import subprocess
 import sys
 import tempfile
@@ -105,7 +106,6 @@ def collect_dsh(sessions_dir: Path) -> dict:
         "会话数": 0,
         "原始发言": 0,
         "计入发言": 0,
-        "整条丢掉": 0,
         "幽灵发言": 0,
         "空发言": 0,
         "原始工具": 0,
@@ -162,9 +162,9 @@ def collect_dsh(sessions_dir: Path) -> dict:
         for t in turns:
             if not re.sub(r"<[^>]+>", "", t["user"]).strip():
                 stats["幽灵发言"] += 1
-    # 这一项是从上面两个数推出来的,不是独立测量;留着只因它在表里能一眼看懂。
-    # 真正的判据是「原始 == 计入」(见 dsh_problems),两个方向错了都能抓到。
-    stats["整条丢掉"] = stats["原始发言"] - stats["计入发言"]
+    # 这里刻意没有「整条丢掉」这一项:它等于「原始 - 计入」,而两边用的是同一
+    # 个判据,所以它恒为 0,永远红不了。一条红不了的指标比没有更糟——它看着像
+    # 覆盖。真正的判据是下面的「原始 == 计入」,两个方向错了都能抓到。
     return stats
 
 
@@ -216,6 +216,72 @@ def compare_dsh(now: dict, base: dict) -> int:
     if not bad:
         print("\n没有指标变差。")
     return 1 if bad else 0
+
+
+def census(sessions_dir: Path) -> int:
+    """接新来源时先看这一眼:日志里到底有哪些记录类型、哪些工具约定。
+
+    存在的理由:第一版适配器只照着手边两个样本写,恰好没看见 `tool/call` 里
+    直接就是真工具的那种会话——36 个会话导出的工具数是 0,而退出码是 0。
+    普查是**信息获取**,不是判断:它只把「文件里有什么」摆出来,不做取舍。
+    """
+    types = Counter()
+    user_kinds = Counter()
+    tool_names = Counter()
+    modes = Counter()
+    sessions = 0
+
+    for p in dsh_logs_in(sessions_dir):
+        sessions += 1
+        try:
+            records = fork.load_records(p)
+        except Exception as e:
+            print(f"  读不了 {p}:{type(e).__name__}: {e}", file=sys.stderr)
+            continue
+        types.update(r.get("type") for r in records)
+        containers = fork.dsh_containers(records)
+
+        ptc = direct = 0
+        for r in records:
+            rtype = r.get("type")
+            if rtype == "user/message":
+                user_kinds[fork.dsh_kind(r)] += 1
+            elif rtype == "tool/ptc-dispatch":
+                ptc += 1
+                tool_names[fork.dsh_data(r).get("name")] += 1
+            elif rtype == "tool/call":
+                d = fork.dsh_data(r)
+                if d.get("callId") not in containers:
+                    direct += 1
+                    tool_names[d.get("name")] += 1
+        if ptc and direct:
+            modes["混用(两种都有)"] += 1
+        elif ptc:
+            modes["PTC(容器 + ptc-dispatch)"] += 1
+        elif direct:
+            modes["直接(tool/call 就是真工具)"] += 1
+        else:
+            modes["没有工具调用"] += 1
+
+    print(f"普查:{sessions} 个会话,{sum(types.values())} 条记录\n")
+
+    print("记录类型:")
+    for name, n in types.most_common():
+        print(f"  {name:40} {n:>7}")
+
+    print("\nuser/message 的 source.kind:")
+    for name, n in user_kinds.most_common():
+        mark = "  ← 用户真说的" if name == fork.DSH_USER_KIND else ""
+        print(f"  {str(name):40} {n:>7}{mark}")
+
+    print("\n工具调用(已扣除容器):")
+    for name, n in tool_names.most_common():
+        print(f"  {str(name):40} {n:>7}")
+
+    print("\n会话形态:")
+    for name, n in modes.most_common():
+        print(f"  {name:40} {n:>7}")
+    return 0
 
 
 def display_width(text: str) -> int:
@@ -331,11 +397,18 @@ def main():
     ap.add_argument("--compare", metavar="FILE", help="和基线比,任何一项变少就非零退出")
     ap.add_argument("--equiv", metavar="REF",
                     help="和这个提交的 fork.py 比输出(如 HEAD~1);只支持 workbuddy")
+    ap.add_argument("--census", action="store_true",
+                    help="接新来源时先看这一眼:记录类型 / source.kind / 工具名 / 会话形态;只支持 dsh")
     ap.add_argument("--limit", type=int, default=8, help="--equiv 比几个会话,默认 8")
     args = ap.parse_args()
 
     if args.source == "dsh":
         return run_dsh(args)
+
+    if args.census:
+        print("--census 只支持 dsh:workbuddy 的日志结构已经稳定,没有「还有别的写法吗」这个问题。",
+              file=sys.stderr)
+        return 2
 
     projects_dir = Path(args.home) if args.home else fork.PROJECTS_DIR
     if not projects_dir.is_dir():
@@ -375,6 +448,9 @@ def run_dsh(args) -> int:
         print(f"找不到 dsh 会话目录:{root}", file=sys.stderr)
         print("用 --home 指定,或检查 DSH_HOME。", file=sys.stderr)
         return 2
+
+    if args.census:
+        return census(root)
 
     stats = collect_dsh(root)
     print(f"{root}\n")

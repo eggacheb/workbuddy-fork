@@ -155,7 +155,9 @@ ARG_PRIORITY = ["file_path", "path", "command", "pattern", "url", "query", "prom
 
 # dsh 的工具名是小写的 bash/read/write/edit,WorkBuddy 是 Bash/Read/Write。
 # 两套都收进来:这里判的是「这个工具动了文件还是跑了命令」,与来源无关。
-EDIT_TOOLS = {"Edit", "Write", "MultiEdit", "NotebookEdit", "edit", "write"}
+# ops_replace 是按正则替换文件内容的 dsh 工具(argument 里叫 path),
+# 和 edit/write 一样会改磁盘,算「改过的文件」。
+EDIT_TOOLS = {"Edit", "Write", "MultiEdit", "NotebookEdit", "edit", "write", "ops_replace"}
 SHELL_TOOLS = {"Bash", "PowerShell", "run_command", "bash", "shell"}
 READ_TOOLS = {"Read", "read"}
 

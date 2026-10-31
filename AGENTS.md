@@ -25,7 +25,8 @@ python scripts/fork.py --path x.zip --outline    # dsh 导出包(来源按内容
 python scripts/fork.py --source dsh --newest -o  # 本机最近的 dsh 会话
 python -m unittest discover -s tests -v         # 全部测试
 python scripts/corpus_check.py                  # 全库回归:发言数 / 占位数 / 整条丢掉数
-python scripts/corpus_check.py --source dsh     # dsh 全库回归:原始 == 计入 / 未认识的 kind
+python scripts/corpus_check.py --source dsh     # dsh 全库回归:原始 == 计入 / 工具不漏 / 未认识的 kind
+python scripts/corpus_check.py --source dsh --census   # 接新来源先跑:记录类型 / kind / 工具名 / 会话形态
 python scripts/corpus_check.py --equiv HEAD~1   # 和旧版逐字节比输出,证明改动等价
 ```
 
@@ -33,7 +34,9 @@ python scripts/corpus_check.py --equiv HEAD~1   # 和旧版逐字节比输出,�
 
 WorkBuddy 的会话日志在 `~/.workbuddy/projects/<项目slug>/<会话Id>.jsonl`,目录可用 `WORKBUDDY_HOME` 覆盖;dsh 的在 `~/.dsh/sessions/<项目slug>/<会话Id>/session.v4.jsonl.zstd`,用 `DSH_HOME` 覆盖。测试全部靠这两个变量指到临时 fixture,**绝不读真实会话**——否则结果取决于这台机器上聊过什么。
 
-dsh 的 `corpus_check` 判的是不变量而不是方向:**计入发言 == 原始发言、幽灵发言 == 0、工具调用 == 原始工具记录、未认识的 `source.kind` == 0、读不了的会话 == 0**(前两条恒等推得出「整条丢掉 == 0」,单独打出来只为看得见)。任何一条破了就非零退出,不带 `--compare` 也查。`--equiv` 只支持 WorkBuddy——老版本 fork.py 根本不认 dsh,没有可比对象。
+dsh 的 `corpus_check` 判的是不变量而不是方向:**计入发言 == 原始发言、幽灵发言 == 0、工具调用 == 原始工具记录、未认识的 `source.kind` == 0、读不了的会话 == 0**。任何一条破了就非零退出,不带 `--compare` 也查。`--equiv` 只支持 WorkBuddy——老版本 fork.py 根本不认 dsh,没有可比对象。
+
+**接一种新来源之前先跑 `--census`**:它把「文件里到底有哪些记录类型 / 哪些 kind / 哪些工具名 / 哪些会话形态」摆出来,不做取舍。第一版 dsh 适配器只照着手边两个样本写,恰好没看见「`tool/call` 里就是真工具」那种会话——36 个会话的工具数导成 0,退出码 0。普查是那次唯一的机械防线。
 
 `pre-commit` 在提交前跑全量测试,不过就拦下(`scripts/sync-skill.sh --install-hooks` 装的)。CI 跑同一份,runner 用 `windows-latest`:中文管道编码那条用例只有在 Windows 上才有意义。
 
@@ -44,6 +47,7 @@ dsh 的 `corpus_check` 判的是不变量而不是方向:**计入发言 == 原�
 这几条都是踩出来的,不是风格偏好。
 
 - **静默错数据比崩溃严重。** 这个脚本历史上每一个 P0 都是「照常打印已导出,退出码 0,但内容是错的」。崩溃会被人发现,错数据不会。新增任何剥离规则,先问:它会不会顺手删掉真信息?
+- **红不了的指标比没有更糟。** `corpus_check` 每加一项,必须同时有一条能把它弄红的用例;造不出这样的用例就删掉那一项。它看着像覆盖,实际上只是让人觉得「这块有人看着」。`整条丢掉` 就是这么被删掉的:它等于「原始 - 计入」,两边同一个判据,恒为 0。
 - **判据要机械,而且按位置判。** 「剥噪音」和「删真信息」的边界必须落在一个可验证的字符串条件上,条件还要**逐个标记判、不按整段判**:「从这个 `@long-text` 到下一个标记之间有没有 `<long_text_quote>`」,而不是「这一段里有没有」。按整段判,一个真引用会把同一句里讨论用的标记一起带走。
 - **被反引号包住的标签不算结构。** 讨论这个工具时必然要把 `<user_query>`、`@image#1:a.png` 写成字面文本,而 `AGENTS.md` 里就写着它们、还会被整篇注进 `user-context`。认了这些假标签,切分就从错误的位置开始:注入被当原话、原话被当注入,还会凭空造出一个挂在不相关消息开头的 `[图片 …]`。注入信封也必须在切分**之前**剥掉,否则信封里的字面标签会先被认走。见 `docs/adr/0004-代码里的标签不算结构.md`。
 - **`<user_query>` 体内是用户原话。** 只摘附件、不碰排版。缩进和空行必须原样留着,否则代码块对齐和 Node 栈的层级会被压平。压空行这条加过又拆了,理由见 `docs/adr/0003-体内不压空行.md`。

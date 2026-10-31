@@ -40,6 +40,7 @@ dsh 的会话目录是 `~/.dsh/sessions/<项目slug>/<会话id>/session.v4.jsonl
 
 dsh 的正文和 WorkBuddy 长得不一样,但**你不用管细节**,只要知道两件事:
 
+- header 里会有一行 `- 来源:dsh 会话导出(session.v4.jsonl)`,和 WorkBuddy 的导出区分开。
 - 平台注入按 `source.kind` 挡掉,不靠文本猜。header 会写 `- 忽略:非用户消息 N 条`,这个数字对得上就说明没吃错东西。
 - 压缩检查点(上下文满了自动生成的摘要)不导出,正文用原文。header 那一行后面会补 `,其中压缩检查点 N 处(原文完整保留)`。
 

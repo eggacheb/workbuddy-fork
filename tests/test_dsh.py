@@ -39,7 +39,8 @@ def 标准会话():
         dsh_dispatch(14, "read", {"file_path": "README.md"}, text="# demo"),
         dsh_dispatch(15, "edit", {"file_path": "a.py", "old_string": "x", "new_string": "y"},
                      meta={"path": "a.py"}),
-        dsh_assistant(16, text="改完了。"),
+        dsh_dispatch(16, "ops_replace", {"path": "b.py", "pattern": "x", "replacement": "y"}),
+        dsh_assistant(17, text="改完了。"),
     ]
 
 
@@ -100,6 +101,7 @@ class 清洗(_DshHome):
         self.assertIn("- bash(", out)
         self.assertIn("- read(", out)
         self.assertIn("- edit(", out)
+        self.assertIn("- ops_replace(", out)
         # run_code 只是 PTC 的容器,露出来等于每轮都写一次「跑了段代码」
         self.assertNotIn("run_code", out)
         # reasoning 是模型的内部独白,和「用户说过什么」无关
@@ -127,6 +129,20 @@ class 清洗(_DshHome):
         self.assertIn("## [2] 助手", out)
         # 编号单位是发言,不是 turn:两条发言就是 [1] 和 [2]
         self.assertIn("全量:用户发言 2 次", out)
+
+
+    def test_包里的关键事实认得dsh的工具名(self):
+        # 事实提取靠工具名认「改过哪些文件」。认不出 dsh 的小写名字,
+        # 包里「关键事实」就会整节空着,而包照常交付。
+        r = self.跑("--package", "--out", str(self.out / "x.md"),
+                    "--source", "dsh", "-s", self.sid)
+
+        self.assertEqual(r.returncode, 0, err_text(r))
+        pkg = self.out / f"{self.sid}-package.md"
+        text = pkg.read_text(encoding="utf-8")
+        self.assertIn("- 改过的文件", text)
+        self.assertIn("a.py", text)
+        self.assertIn("b.py", text)
 
 
 class 压缩(_DshHome):
@@ -238,7 +254,6 @@ class 语料(unittest.TestCase):
         self.assertEqual(stats["原始发言"], 2)
         self.assertEqual(stats["计入发言"], 2)
         self.assertEqual(stats["注入了多少"], 6)
-        self.assertEqual(stats["整条丢掉"], 0)
 
     def test_计入发言变少就是回归(self):
         self.跑("--save", str(self.base))
@@ -351,6 +366,61 @@ class 输入(_DshHome):
         self.assertNotEqual(r.returncode, 0)
         self.assertTrue(err_text(r).strip(), "读不了也要说一句人话,不能静默")
         self.assertEqual(out_text(r), "")
+
+
+class 文档口径(_DshHome):
+    """SKILL.md 是模型实际加载的那一份。
+
+    它写的 header 字面量和代码输出对不上,等于承诺失效——而这类漂移没有任何
+    东西会报错:代码照常跑、测试照常绿。所以把两边钉在一起。
+    """
+
+    # 契约只有这一处:代码要输出它,SKILL.md / README.md 要写着它。
+    # 数字(忽略几条)不进契约,文档里写不完,只钉前缀。
+    FRAGMENTS = (
+        "- 来源:dsh 会话导出(session.v4.jsonl)",
+        "- 忽略:非用户消息",
+    )
+
+    def test_文档和代码说的是同一句话(self):
+        r = self.跑("--stdout", "--source", "dsh", "-s", self.sid)
+        self.assertEqual(r.returncode, 0, err_text(r))
+        out = out_text(r)
+
+        for frag in self.FRAGMENTS:
+            with self.subTest(frag=frag):
+                self.assertIn(frag, out, "代码已经不输出这句话了,文档却还写着")
+                for doc in ("SKILL.md", "README.md"):
+                    text = (support.REPO / doc).read_text(encoding="utf-8")
+                    self.assertIn(frag, text, f"{doc} 里的字面量漂了")
+
+
+class 普查(_DshHome):
+    """接新来源时先看这一眼。它只摆事实,不做取舍。"""
+
+    def 跑普查(self, *extra):
+        import subprocess
+        import sys
+        return subprocess.run(
+            [sys.executable, str(support.SCRIPTS / "corpus_check.py"),
+             "--source", "dsh", "--census", "--home", str(self.home / "sessions"), *extra],
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=120)
+
+    def test_列出工具名和会话形态(self):
+        support.write_dsh_layout(self.home, 标准会话())
+        support.write_dsh_layout(self.home, 直接模式会话(), session_id="session-22222222-2222-3333-4444-555555555555",
+                                 project="proj2")
+
+        r = self.跑普查()
+
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("tool/call", r.stdout)
+        self.assertIn("tool/ptc-dispatch", r.stdout)
+        self.assertIn("PTC", r.stdout)
+        self.assertIn("直接", r.stdout)
+        # 真工具的名字要能看见,容器的名字不该混进来
+        self.assertIn("bash", r.stdout)
+        self.assertIn("read", r.stdout)
 
 
 if __name__ == "__main__":
