@@ -858,6 +858,19 @@ def dsh_ts(record):
     return v if isinstance(v, (int, float)) else 0
 
 
+def dsh_containers(records) -> set:
+    """哪些 tool/call 只是 PTC 容器(run_code),不是真工具。
+
+    PTC 模式里真工具挂在容器下面的 ptc-dispatch 里;直接模式里 tool/call 自己
+    就是真工具(read/bash)。判据是「有没有东西挂在它下面」,不是名字——按名字
+    认 run_code,平台改个名就又开始静默漏工具,而导出照常、退出码 0。
+    """
+    roots = {dsh_data(r).get("rootCallId") for r in records
+             if r.get("type") == "tool/ptc-dispatch"}
+    roots.discard(None)
+    return roots
+
+
 def build_turns_dsh(records):
     """dsh:只认 source.kind == "user" 的发言,其余按来源丢弃并计数。
 
@@ -869,6 +882,8 @@ def build_turns_dsh(records):
     """
     turns, cur = [], None
     stats = {"ignored": 0, "compactions": 0, "calls": 0, "unknown": Counter()}
+
+    containers = dsh_containers(records)
 
     for r in records:
         rtype = r.get("type")
@@ -898,13 +913,16 @@ def build_turns_dsh(records):
                 if said:
                     cur["blocks"].append(("say", said))
 
-        elif rtype == "tool/ptc-dispatch":
-            # 真正的工具在 PTC 派发这一层;tool/call 里只有 run_code 这个容器,
-            # 露在正文里等于每轮都写一句「跑了一段代码」,没有信息量。
+        elif rtype in ("tool/call", "tool/ptc-dispatch"):
             if cur is None:
                 continue
             d = dsh_data(r)
+            if rtype == "tool/call" and d.get("callId") in containers:
+                continue  # PTC 容器,真工具在它下面的 ptc-dispatch 里
             args = d.get("arguments")
+            if isinstance(args, str):
+                # 直接模式里 arguments 是 JSON 字符串,PTC 里已经是 dict
+                args = parse_args_of(d)
             if not isinstance(args, dict):
                 args = {}
             call = {"name": d.get("name") or "?", "args": args}

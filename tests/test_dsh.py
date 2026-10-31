@@ -18,7 +18,7 @@ from support import (
 
 
 def 标准会话():
-    """2 条真发言 + 6 种注入 + 一次 run_code 里的三个真工具。"""
+    """2 条真发言 + 6 种注入 + PTC 模式:run_code 容器里挂三个真工具。"""
     return [
         dsh_header(cwd="D:\\code\\demo"),
         dsh_title("整理项目结构"),
@@ -31,14 +31,30 @@ def 标准会话():
         dsh_user(7, "<path>/tmp/a.png</path><type>image</type>", kind="ptc-mode"),
         dsh_user(8, "把项目结构理一遍"),
         dsh_assistant(9, text="我先看看目录。", reasoning="这是内部思考,不该出现在导出里",
-                      call=("c1", "run_code", {"code": "await tools.bash({...})"})),
-        dsh_dispatch(10, "bash", {"command": "ls -la"}, text="total 0"),
-        dsh_result(11, "total 0"),
-        dsh_user(12, "顺便把 pcb 也看了"),
-        dsh_dispatch(13, "read", {"file_path": "README.md"}, text="# demo"),
-        dsh_dispatch(14, "edit", {"file_path": "a.py", "old_string": "x", "new_string": "y"},
+                      call=("run-1", "run_code", {"code": "await tools.bash({...})"})),
+        support.dsh_tool_call(10, "run_code", {"code": "await tools.bash({...})"}),
+        dsh_dispatch(11, "bash", {"command": "ls -la"}, text="total 0"),
+        dsh_result(12, "total 0"),
+        dsh_user(13, "顺便把 pcb 也看了"),
+        dsh_dispatch(14, "read", {"file_path": "README.md"}, text="# demo"),
+        dsh_dispatch(15, "edit", {"file_path": "a.py", "old_string": "x", "new_string": "y"},
                      meta={"path": "a.py"}),
-        dsh_assistant(15, text="改完了。"),
+        dsh_assistant(16, text="改完了。"),
+    ]
+
+
+def 直接模式会话():
+    """没有 PTC:tool/call 里就是真工具本身(真实样本 session-195b8a08 就是这样)。"""
+    return [
+        dsh_header(cwd="F:\\毕设\\stm32智能门禁系统"),
+        dsh_title("直接模式的会话"),
+        dsh_turn(1),
+        dsh_user(2, "这个 README 什么意思"),
+        dsh_assistant(3, text="我读一下。",
+                      call=("toolu_a", "read", {"file_path": "README.md"})),
+        support.dsh_tool_call(4, "read", {"file_path": "README.md"}, call_id="toolu_a"),
+        dsh_result(5, "1: 标题\n2: 介绍"),
+        dsh_assistant(6, text="明白了。"),
     ]
 
 
@@ -89,6 +105,16 @@ class 清洗(_DshHome):
         # reasoning 是模型的内部独白,和「用户说过什么」无关
         self.assertNotIn("内部思考", out)
         self.assertIn("我先看看目录。", out)
+
+    def test_直接模式的工具调用也要出来(self):
+        # 真实样本 session-195b8a08:没有 PTC,工具就是 tool/call 里的 read/bash。
+        # 只认 ptc-dispatch 的话,这种会话导出的工具数是 0,而退出码照样是 0。
+        r = self.跑("--stdout", "--source", "dsh", "-s", self.sid, records=直接模式会话())
+
+        self.assertEqual(r.returncode, 0, err_text(r))
+        out = out_text(r)
+        self.assertIn("- read(README.md)", out)
+        self.assertIn("工具调用 1 次", out)
 
     def test_一个turn里的第二条发言独立成节(self):
         # 真实日志里 turn 4 有两条发言,中间隔了 16 个 step。按 turn 编号
@@ -241,8 +267,8 @@ class 语料(unittest.TestCase):
     def test_剥完只剩标签的发言会被抓出来(self):
         self.跑("--save", str(self.base))
         records = 标准会话() + [
-            dsh_user(16, "<system-reminder></system-reminder>"),
-            dsh_assistant(17, text="嗯"),
+            dsh_user(20, "<system-reminder></system-reminder>"),
+            dsh_assistant(21, text="嗯"),
         ]
         support.write_dsh_layout(self.home, records)
 

@@ -108,6 +108,8 @@ def collect_dsh(sessions_dir: Path) -> dict:
         "整条丢掉": 0,
         "幽灵发言": 0,
         "空发言": 0,
+        "原始工具": 0,
+        "工具调用": 0,
         "注入了多少": 0,
         "压缩检查点": 0,
         "未认识的 kind": 0,
@@ -120,21 +122,35 @@ def collect_dsh(sessions_dir: Path) -> dict:
             print(f"  跳过 {p}:{e}", file=sys.stderr)
             continue
 
+        containers = fork.dsh_containers(records)
         raw = 0
+        raw_tools = 0
+        seen_user = False
         for r in records:
-            if r.get("type") != "user/message":
+            rtype = r.get("type")
+            if rtype == "user/message" and fork.dsh_kind(r) == fork.DSH_USER_KIND:
+                if fork.dsh_text(fork.dsh_message(r)).strip():
+                    raw += 1
+                    seen_user = True
+                else:
+                    # 空的 kind=user 消息不进正文是对的,但数出来:否则「按设计丢」
+                    # 和「规则误删」在指标上长得一样。
+                    stats["空发言"] += 1
                 continue
-            if fork.dsh_kind(r) != fork.DSH_USER_KIND:
+            if not seen_user:
                 continue
-            if fork.dsh_text(fork.dsh_message(r)).strip():
-                raw += 1
-            else:
-                # 空的 kind=user 消息不进正文是对的,但数出来:否则「按设计丢」
-                # 和「规则误删」在指标上长得一样。
-                stats["空发言"] += 1
+            # 独立的「工具记录」判据:ptc-dispatch,加上不是容器的 tool/call。
+            # 和 build_turns_dsh 各写一遍是故意的——只认一种约定时,
+            # 这里会立刻不等。
+            if rtype == "tool/ptc-dispatch":
+                raw_tools += 1
+            elif rtype == "tool/call" and fork.dsh_data(r).get("callId") not in containers:
+                raw_tools += 1
         stats["原始发言"] += raw
+        stats["原始工具"] += raw_tools
 
         turns, s = fork.build_turns_dsh(records)
+        stats["工具调用"] += sum(len(t["calls"]) for t in turns)
         stats["计入发言"] += len(turns)
         stats["注入了多少"] += s["ignored"]
         stats["压缩检查点"] += s["compactions"]
@@ -157,6 +173,9 @@ def dsh_problems(stats: dict):
     if stats["未认识的 kind"]:
         out.append(f"有 {stats['未认识的 kind']} 条 source.kind 是脚本不认识的,已按注入丢弃。"
                    "先确认那不是人话;是的话改 DSH_KNOWN_KINDS,不要放行。")
+    if stats["原始工具"] != stats["工具调用"]:
+        out.append(f"日志里有 {stats['原始工具']} 条工具记录,导出只拿到 {stats['工具调用']} 次:"
+                   "有一种工具约定没被认出来(只认了 ptc-dispatch?)。")
     return out
 
 

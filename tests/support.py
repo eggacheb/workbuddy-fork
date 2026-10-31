@@ -159,6 +159,21 @@ def dsh_assistant(seq, text=None, reasoning=None, call=None, turn=1, step=1):
     })
 
 
+def dsh_tool_call(seq, name, args, call_id="run-1", turn=1, step=1):
+    """直接模式下的工具调用:名字就是真工具(bash/read/edit),不是 run_code 容器。
+
+    和 PTC 模式的区别只在「有没有 ptc-dispatch 挂在它下面」——判据是结构,
+    不是名字。
+    """
+    return dsh_event("tool/call", seq, {
+        "turn": turn,
+        "step": step,
+        "callId": call_id,
+        "name": name,
+        "arguments": json.dumps(args, ensure_ascii=False),
+    })
+
+
 def dsh_dispatch(seq, name, args, text="", is_error=False, meta=None, turn=1, step=1):
     return dsh_event("tool/ptc-dispatch", seq, {
         "turn": turn,
